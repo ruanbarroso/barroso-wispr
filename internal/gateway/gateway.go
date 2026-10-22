@@ -1,0 +1,172 @@
+// Package gateway fala com o barroso-keys: emite o token efêmero da Live API
+// (/v1/audio/live-token) e faz o passe de limpeza no Chat Completions.
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// UserAgent nomeado: WAF de provider bloqueia Go-http-client/1.1 antes de
+// olhar a chave (lição do barroso-harness).
+const UserAgent = "barroso-wispr"
+
+type Cliente struct {
+	BaseURL string
+	APIKey  string
+	HTTP    *http.Client
+}
+
+func Novo(baseURL, apiKey string) *Cliente {
+	return &Cliente{BaseURL: strings.TrimSuffix(baseURL, "/"), APIKey: apiKey, HTTP: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// Token é o que o live-token devolve. Servido vem do header x-served-model:
+// o modelo REAL que atendeu, necessário para montar o setup da sessão.
+type Token struct {
+	Token     string `json:"token"`
+	ExpiraEm  string `json:"expira_em"`
+	Model     string `json:"model"`
+	RequestID string `json:"request_id"`
+	Servido   string `json:"-"`
+}
+
+func (c *Cliente) post(ctx context.Context, path string, body any) (*http.Response, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
+	return c.HTTP.Do(req)
+}
+
+// resumoErro tira uma linha legível de um corpo de erro.
+func resumoErro(status int, b []byte) error {
+	var j struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	msg := strings.TrimSpace(string(b))
+	if json.Unmarshal(b, &j) == nil && j.Error.Message != "" {
+		msg = j.Error.Message
+	}
+	if len(msg) > 300 {
+		msg = msg[:300]
+	}
+	return fmt.Errorf("HTTP %d: %s", status, msg)
+}
+
+// LiveToken pede o token efêmero para o modelo (virtual ou real).
+func (c *Cliente) LiveToken(ctx context.Context, model string) (Token, error) {
+	resp, err := c.post(ctx, "/audio/live-token", map[string]any{"model": model})
+	if err != nil {
+		return Token{}, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return Token{}, resumoErro(resp.StatusCode, b)
+	}
+	var t Token
+	if err := json.Unmarshal(b, &t); err != nil {
+		return Token{}, err
+	}
+	if t.Token == "" {
+		return Token{}, errors.New("live-token sem token")
+	}
+	t.Servido = resp.Header.Get("x-served-model")
+	if t.Servido == "" {
+		t.Servido = t.Model
+	}
+	return t, nil
+}
+
+// Uso é o consumo somado da sessão, devolvido ao gateway para fechar o log.
+type Uso struct {
+	Entrada int
+	Saida   int
+}
+
+// LiveUsage reporta o uso da sessão (melhor esforço).
+func (c *Cliente) LiveUsage(ctx context.Context, requestID string, u Uso) error {
+	// Campos no nível de cima, como o liveUsage do gateway lê.
+	resp, err := c.post(ctx, "/audio/live-usage", map[string]any{
+		"request_id":        requestID,
+		"prompt_tokens":     u.Entrada,
+		"completion_tokens": u.Saida,
+		"total_tokens":      u.Entrada + u.Saida,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return resumoErro(resp.StatusCode, b)
+	}
+	return nil
+}
+
+// LiveFailure avisa que o Google recusou a sessão depois do token emitido
+// (ex.: teto de gasto do projeto), para a conta sair do rodízio. Melhor esforço.
+func (c *Cliente) LiveFailure(ctx context.Context, requestID string) error {
+	resp, err := c.post(ctx, "/audio/live-failure", map[string]any{"request_id": requestID})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return resumoErro(resp.StatusCode, b)
+	}
+	return nil
+}
+
+// Chat faz uma chamada Chat Completions sem stream e devolve o texto.
+func (c *Cliente) Chat(ctx context.Context, model, system, user string) (string, error) {
+	resp, err := c.post(ctx, "/chat/completions", map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": system},
+			{"role": "user", "content": user},
+		},
+		"temperature": 0,
+		"stream":      false,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", resumoErro(resp.StatusCode, b)
+	}
+	var j struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(b, &j); err != nil {
+		return "", err
+	}
+	if len(j.Choices) == 0 {
+		return "", errors.New("resposta sem choices")
+	}
+	return j.Choices[0].Message.Content, nil
+}
