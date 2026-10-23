@@ -2,7 +2,7 @@
 // hook do sistema para poder ser testada:
 //
 //   - segurar o atalho (sozinho, sem outra tecla) por Segurar = grava; soltar = para;
-//   - dois toques rápidos = trava: grava sem segurar, e o próximo toque encerra.
+//   - dois toques rápidos = trava: grava sem segurar; pressionar de novo encerra imediatamente.
 //
 // "Sozinho" importa: no ABNT2, Ctrl+Alt é o AltGr (/, ?, °). Se qualquer
 // outra tecla for pressionada com o atalho, ele é cancelado.
@@ -56,7 +56,12 @@ func (m *Maquina) Pressionou(agora time.Time) Evento {
 			return Comecar
 		}
 	case travado:
-		m.st = soltandoTrava
+		// O segundo toque de destravar para imediatamente. Esperar `Soltou`
+		// é frágil: o hook do Windows pode não entregar KeyUp quando a janela
+		// que tem foco trata a combinação como atalho.
+		m.st = ocioso
+		m.ultimoToque = time.Time{}
+		return Parar
 	}
 	return Nada
 }

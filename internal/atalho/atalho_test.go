@@ -49,9 +49,35 @@ func TestToqueDuploTravaEToqueSeguinteEncerra(t *testing.T) {
 	if e := m.Tick(at(5000)); e != Nada || !m.Gravando() {
 		t.Fatalf("trava segue gravando: %v", e)
 	}
-	m.Pressionou(at(9000))
-	if e := m.Soltou(at(9080)); e != Parar {
-		t.Fatalf("toque na trava encerra: %v", e)
+	if e := m.Pressionou(at(9000)); e != Parar {
+		t.Fatalf("pressionar de novo encerra a trava imediatamente: %v", e)
+	}
+	if m.Gravando() {
+		t.Fatal("depois do toque de destravar não deve continuar gravando")
+	}
+	if e := m.Soltou(at(9080)); e != Nada {
+		t.Fatalf("soltar depois de destravar não para novamente: %v", e)
+	}
+}
+
+func TestTravaDestravaMesmoSeNaoChegarEventoSoltou(t *testing.T) {
+	var m Maquina
+	m.Pressionou(at(0))
+	m.Soltou(at(80))
+	if e := m.Pressionou(at(250)); e != Comecar {
+		t.Fatalf("duplo toque deve começar travado: %v", e)
+	}
+	m.Soltou(at(300)) // solta o segundo toque, continua gravando
+	if !m.Gravando() {
+		t.Fatal("segundo toque solto deve continuar travado")
+	}
+	// A combinação vira e perde foco antes do key-up: pressionar deve bastar
+	// para terminar; a máquina não pode depender do próximo KeyUp.
+	if e := m.Pressionou(at(10_000)); e != Parar {
+		t.Fatalf("pressionar novamente deve parar: %v", e)
+	}
+	if m.Gravando() {
+		t.Fatal("trava não foi encerrada")
 	}
 }
 

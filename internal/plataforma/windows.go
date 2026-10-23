@@ -94,6 +94,47 @@ type Teclado struct {
 	ctrl   atomic.Bool
 	alt    atomic.Bool
 	ativo  atomic.Bool
+
+	// fila tira os callbacks do app de dentro do hook. Um WH_KEYBOARD_LL que
+	// demora a voltar (abrir o microfone, por exemplo) é removido pelo Windows
+	// sem aviso (LowLevelHooksTimeout), e a partir daí nenhuma tecla chega —
+	// era o que travava a gravação no toque duplo, cujo início rodava aqui.
+	fila chan func()
+	fim  chan struct{}
+}
+
+func (t *Teclado) iniciarFila() {
+	t.fila, t.fim = make(chan func(), 64), make(chan struct{})
+	go func() {
+		defer close(t.fim)
+		for f := range t.fila {
+			f()
+		}
+	}()
+}
+
+func (t *Teclado) pararFila() {
+	if t.fila != nil {
+		close(t.fila)
+		<-t.fim
+		t.fila = nil
+	}
+}
+
+// emitir entrega o callback em ordem, sem nunca bloquear o hook. Sem fila
+// (testes), chama direto.
+func (t *Teclado) emitir(f func()) {
+	if f == nil {
+		return
+	}
+	if t.fila == nil {
+		f()
+		return
+	}
+	select {
+	case t.fila <- f:
+	default: // fila cheia: perder um evento é melhor que perder o hook
+	}
 }
 
 // Rodar instala o hook e bloqueia no laço de mensagens até Parar.
@@ -102,6 +143,8 @@ func (t *Teclado) Rodar() error {
 	defer runtime.UnlockOSThread()
 	tid, _, _ := procGetCurrentThreadId.Call()
 	t.thread = uint32(tid)
+	t.iniciarFila()
+	defer t.pararFila()
 
 	// lParam chega como ponteiro tipado: evita a conversão uintptr→Pointer que
 	// o vet (corretamente) reprova.
@@ -145,12 +188,12 @@ func (t *Teclado) tecla(vk uint32, desce, sobe bool) {
 		t.mudou(&t.alt, desce, sobe)
 	case vkRControl, vkRMenu:
 		// AltGr e Ctrl direito: tratar como "outra tecla" para não disparar.
-		if desce && t.OutraTecla != nil {
-			t.OutraTecla()
+		if desce {
+			t.emitir(t.OutraTecla)
 		}
 	default:
-		if desce && (t.ctrl.Load() || t.alt.Load()) && t.OutraTecla != nil {
-			t.OutraTecla()
+		if desce && (t.ctrl.Load() || t.alt.Load()) {
+			t.emitir(t.OutraTecla)
 		}
 	}
 }
@@ -164,14 +207,10 @@ func (t *Teclado) mudou(b *atomic.Bool, desce, sobe bool) {
 	completo := t.ctrl.Load() && t.alt.Load()
 	if completo && !t.ativo.Load() {
 		t.ativo.Store(true)
-		if t.Pressionou != nil {
-			t.Pressionou()
-		}
+		t.emitir(t.Pressionou)
 	} else if !completo && t.ativo.Load() {
 		t.ativo.Store(false)
-		if t.Soltou != nil {
-			t.Soltou()
-		}
+		t.emitir(t.Soltou)
 	}
 }
 
