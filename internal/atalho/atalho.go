@@ -112,3 +112,12 @@ func (m *Maquina) Soltou(agora time.Time) Evento {
 func (m *Maquina) Gravando() bool {
 	return m.st == gravando || m.st == travado || m.st == soltandoTrava
 }
+
+// Reset volta ao estado ocioso sem devolver eventos; o chamador já sabe o que
+// fazer (encerrar um ditado em curso ou abortar uma troca de processo).
+func (m *Maquina) Reset() {
+	m.st = ocioso
+	m.desde = time.Time{}
+	m.ultimoToque = time.Time{}
+	m.sujo = false
+}

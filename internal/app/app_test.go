@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ruanbarroso/barroso-wispr/internal/atalho"
 	"github.com/ruanbarroso/barroso-wispr/internal/gateway"
 )
 
@@ -47,13 +48,28 @@ func (s *sessaoFake) Finalizar(context.Context, time.Duration, time.Duration) (s
 func (s *sessaoFake) Uso() (int, int) { return 1, 1 }
 func (s *sessaoFake) Fechar()         {}
 
+type bloqueiaFinal struct {
+	iniciou chan struct{}
+	libera  chan struct{}
+}
+
+func (s *bloqueiaFinal) EnviarAudio(context.Context, []byte) error { return nil }
+func (s *bloqueiaFinal) Finalizar(context.Context, time.Duration, time.Duration) (string, error) {
+	close(s.iniciou)
+	<-s.libera
+	return "texto final", nil
+}
+func (s *bloqueiaFinal) Uso() (int, int) { return 0, 0 }
+func (s *bloqueiaFinal) Fechar()         {}
+
 type chatFake struct{}
 
 func (chatFake) Chat(context.Context, string, string, string) (string, error) {
 	return "Olá, KIS!", nil
 }
 
-func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
+func newAppTest(t *testing.T, sess Sessao, paste func(string) error) *App {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/audio/live-token":
@@ -65,87 +81,138 @@ func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	return Novo(Deps{
+		Gateway:    gateway.Novo(server.URL+"/v1", "test"),
+		Chat:       chatFake{},
+		Abrir:      func(context.Context, string, string, string) (Sessao, error) { return sess, nil },
+		Microfone:  &micFake{stopped: make(chan struct{})},
+		Digitar:    paste,
+		Dicionario: func() []string { return []string{"KIS"} },
+		ModeloVoz:  "barroso-audio-stream", ModeloQuik: "barroso-quick",
+	})
+}
 
-	mic := &micFake{stopped: make(chan struct{})}
-	s := &sessaoFake{finalizou: make(chan struct{})}
+func TestHandoffWaitsForFinalizationAndPaste(t *testing.T) {
+	sess := &bloqueiaFinal{iniciou: make(chan struct{}), libera: make(chan struct{})}
+	pasteEntered := make(chan struct{})
+	pasteContinue := make(chan struct{})
+	a := newAppTest(t, sess, func(string) error {
+		close(pasteEntered)
+		<-pasteContinue
+		return nil
+	})
+	a.comecar()
+	a.mu.Lock()
+	g := a.rec
+	a.mu.Unlock()
+	select {
+	case <-g.pronta:
+	case <-time.After(time.Second):
+		t.Fatal("session setup did not finish")
+	}
+	handoff := make(chan struct{}, 1)
+	a.DefinirParada(func() {})
+	a.PedirTroca(func() bool { handoff <- struct{}{}; return true })
+	go a.parar(true)
+	select {
+	case <-sess.iniciou:
+	case <-time.After(time.Second):
+		t.Fatal("finalization did not start")
+	}
+	select {
+	case <-handoff:
+		t.Fatal("handoff started during Live finalization")
+	default:
+	}
+	close(sess.libera)
+	select {
+	case <-pasteEntered:
+	case <-time.After(time.Second):
+		t.Fatal("paste did not start")
+	}
+	select {
+	case <-handoff:
+		t.Fatal("handoff started before paste completed")
+	default:
+	}
+	close(pasteContinue)
+	select {
+	case <-handoff:
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not start after paste completed")
+	}
+}
+
+func TestPendingHandoffPreventsNewRecording(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	a.mu.Lock()
+	a.ativos = 1 // um ditado em curso: a troca fica pendente
+	a.mu.Unlock()
+	a.PedirTroca(func() bool { return true })
+	a.Pressionou()
+	a.Tick()
+	if a.rec != nil {
+		t.Fatal("recording started while handoff is pending")
+	}
+}
+
+func TestHandoffFailureResetsHotkey(t *testing.T) {
+	a := newAppTest(t, &sessaoFake{finalizou: make(chan struct{})}, func(string) error { return nil })
+	a.DefinirParada(func() {})
+	a.PedirTroca(func() bool { return false })
+	a.Pressionou()
+	a.Tick()
+	if a.rec != nil {
+		t.Fatal("failed handoff started a recording")
+	}
+	a.comMaq(func(m *atalho.Maquina) atalho.Evento { return m.Pressionou(time.Now()) })
+	if e := a.comMaq(func(m *atalho.Maquina) atalho.Evento { return m.Tick(time.Now().Add(atalho.Segurar)) }); e != atalho.Comecar {
+		t.Fatalf("hotkey did not recover after failed handoff: %v", e)
+	}
+}
+
+func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
 	digitado := make(chan string, 1)
 	beeps := make(chan string, 2)
-	a := Novo(Deps{
-		Gateway:   gateway.Novo(server.URL+"/v1", "test"),
-		Chat:      chatFake{},
-		Abrir:     func(context.Context, string, string, string) (Sessao, error) { return s, nil },
-		Microfone: mic,
-		Digitar:   func(text string) error { digitado <- text; return nil },
-		Dicionario: func() []string {
-			return []string{"KIS"}
-		},
-		ModeloVoz:  "barroso-audio-stream",
-		ModeloQuik: "barroso-quick",
-		BeepReady:  func() { beeps <- "ready" },
-		BeepDone:   func() { beeps <- "done" },
-	})
+	a := newAppTest(t, sess, func(text string) error { digitado <- text; return nil })
+	a.d.BeepReady = func() { beeps <- "ready" }
+	a.d.BeepDone = func() { beeps <- "done" }
 
-	// Toque 1: armar; toque 2: iniciar travado.
 	a.Pressionou()
 	a.Soltou()
 	a.Pressionou()
-	a.Soltou() // soltar o segundo toque mantém a gravação travada
-
-	// Aguarda a sessão abrir, como o usuário esperaria após o segundo toque.
+	a.Soltou()
 	select {
 	case got := <-beeps:
 		if got != "ready" {
-			t.Fatalf("primeiro beep = %q, want ready", got)
+			t.Fatalf("first beep = %q, want ready", got)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("não tocou o beep de pronto")
+		t.Fatal("ready beep not played")
 	}
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("sessão Live não abriu")
-		default:
-		}
-		if mic.active {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	// O toque seguinte deve encerrar a gravação imediatamente — mesmo antes
-	// de seu KeyUp chegar (o bug relatado dependia desse evento).
 	a.Pressionou()
-	select {
-	case <-mic.stopped:
-	case <-time.After(2 * time.Second):
-		t.Fatal("o novo pressionamento não parou o microfone")
-	}
 	select {
 	case got := <-beeps:
 		if got != "done" {
-			t.Fatalf("segundo beep = %q, want done", got)
+			t.Fatalf("second beep = %q, want done", got)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("não tocou o beep de fim")
+		t.Fatal("done beep not played")
 	}
 	select {
-	case extra := <-beeps:
-		t.Fatalf("beep inesperado: %q", extra)
-	default:
-	}
-	select {
-	case <-s.finalizou:
+	case <-sess.finalizou:
 	case <-time.After(2 * time.Second):
-		t.Fatal("sessão Live não foi finalizada")
+		t.Fatal("Live session not finalized")
 	}
 	select {
 	case got := <-digitado:
 		if !strings.Contains(got, "KIS") {
-			t.Fatalf("texto limpo inesperado: %q", got)
+			t.Fatalf("unexpected cleanup: %q", got)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("texto não foi digitado após destravar")
+		t.Fatal("text not pasted")
 	}
 }

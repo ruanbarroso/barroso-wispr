@@ -97,10 +97,11 @@ type Teclado struct {
 	Soltou     func()
 	OutraTecla func()
 
-	thread uint32
-	ctrl   atomic.Bool
-	alt    atomic.Bool
-	ativo  atomic.Bool
+	thread  uint32
+	OnReady func()
+	ctrl    atomic.Bool
+	alt     atomic.Bool
+	ativo   atomic.Bool
 
 	// fila tira os callbacks do app de dentro do hook. Um WH_KEYBOARD_LL que
 	// demora a voltar (abrir o microfone, por exemplo) é removido pelo Windows
@@ -170,6 +171,9 @@ func (t *Teclado) Rodar() error {
 		return err
 	}
 	defer procUnhookWindowsHookEx.Call(h)
+	if t.OnReady != nil {
+		t.OnReady()
+	}
 
 	var m msg
 	for {

@@ -51,6 +51,12 @@ type App struct {
 	maq atalho.Maquina
 	rec *gravacao
 
+	ativos   int // inclui finalização, limpeza e colagem após rec ser limpo
+	trocaPed bool
+	trocando bool
+	troca    func() bool
+	parada   func()
+
 	// Token Live pedido com antecedência: o live-token do gateway variou de
 	// 0,4 s a 13 s, e era quase todo o tempo de abertura da sessão.
 	tokMu    sync.Mutex
@@ -126,6 +132,62 @@ type gravacao struct {
 
 func Novo(d Deps) *App { return &App{d: d} }
 
+// PedirTroca agenda f (que encerra o processo para a versão nova) para o
+// primeiro momento em que nenhum ditado estiver em curso — inclusive a
+// finalização, a limpeza e a colagem. Até lá, o atalho não começa gravação
+// nova. Se f devolver false, a troca é abandonada e o atalho volta ao normal.
+func (a *App) DefinirParada(f func()) {
+	a.mu.Lock()
+	a.parada = f
+	a.mu.Unlock()
+	a.talvezTrocar()
+}
+
+func (a *App) PedirTroca(f func() bool) {
+	a.mu.Lock()
+	a.troca, a.trocaPed = f, true
+	a.mu.Unlock()
+	a.talvezTrocar()
+}
+
+// Ocioso informa se não há ditado em curso nem troca de processo começada.
+func (a *App) Ocioso() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ativos == 0 && !a.trocando
+}
+
+func (a *App) talvezTrocar() {
+	a.mu.Lock()
+	if !a.trocaPed || a.trocando || a.ativos > 0 || a.troca == nil || a.parada == nil {
+		a.mu.Unlock()
+		return
+	}
+	f := a.troca
+	a.trocando = true
+	a.mu.Unlock()
+	if f() {
+		a.mu.Lock()
+		parar := a.parada
+		a.mu.Unlock()
+		if parar != nil {
+			parar()
+		}
+		return
+	}
+	a.mu.Lock()
+	a.trocando, a.trocaPed, a.troca = false, false, nil
+	a.maq.Reset()
+	a.mu.Unlock()
+}
+
+func (a *App) terminouDitado() {
+	a.mu.Lock()
+	a.ativos--
+	a.mu.Unlock()
+	a.talvezTrocar()
+}
+
 func (a *App) logf(format string, args ...any) {
 	if a.d.Log != nil {
 		fmt.Fprintf(a.d.Log, time.Now().Format("15:04:05.000")+" "+format+"\n", args...)
@@ -149,7 +211,17 @@ func (a *App) Tick() {
 func (a *App) comMaq(f func(*atalho.Maquina) atalho.Evento) atalho.Evento {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return f(&a.maq)
+	if a.trocando {
+		return atalho.Nada
+	}
+	e := f(&a.maq)
+	// Com troca pedida, deixa terminar o ditado em curso (Parar/Cancelar
+	// passam), mas não começa outro.
+	if e == atalho.Comecar && a.trocaPed {
+		a.maq.Reset()
+		return atalho.Nada
+	}
+	return e
 }
 
 func (a *App) tratar(e atalho.Evento) {
@@ -168,13 +240,14 @@ func (a *App) tratar(e atalho.Evento) {
 // para não perder a primeira palavra.
 func (a *App) comecar() {
 	a.mu.Lock()
-	if a.rec != nil {
+	if a.rec != nil || a.trocaPed || a.trocando {
 		a.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	g := &gravacao{ctx: ctx, cancel: cancel, inicio: time.Now(), pronta: make(chan struct{})}
 	a.rec = g
+	a.ativos++
 	a.mu.Unlock()
 	err := a.d.Microfone.Iniciar(func(pcm []byte) {
 		b := append([]byte(nil), pcm...)
@@ -242,6 +315,7 @@ func (a *App) parar(entregar bool) {
 		return
 	}
 	defer g.cancel()
+	defer a.terminouDitado() // roda por último: depois da colagem e do Fechar
 	// Depois de um ditado costuma vir outro: deixa o próximo token pronto.
 	defer a.Aquecer()
 	a.d.Microfone.Parar()

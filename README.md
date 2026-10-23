@@ -22,6 +22,26 @@ Run `barroso-wispr.exe` and leave it open. Logs go to the terminal and to
 `~/.barroso-wispr/wispr.log`. It cannot type into windows running as
 administrator unless it also runs elevated.
 
+### Automatic updates
+
+The Windows app checks the latest stable release on GitHub at startup and then
+about once every 24 hours. A verified update downloads in the background and is
+applied only after dictation, final transcription, cleanup, and paste have
+finished. Wispr then restarts with the same arguments, working directory, and
+environment; recording is briefly unavailable during this handoff.
+
+Updates do not require administrator access and never request elevation. The
+install directory must be writable by the current user; otherwise the verified
+file remains under `~/.barroso-wispr/update` and the log says that a manual
+upgrade is needed. Release checks and downloads use the network but failures do
+not interrupt dictation. `dev` builds and unsupported architectures skip
+updates. The updater uses each release's SHA-256 and candidate `-version`
+checks before replacing the executable, keeping a numbered backup for rollback.
+
+The currently published executables do not include this updater. Users must
+manually install one release containing the updater before future releases can
+install automatically.
+
 ## Credential setup
 
 Set exactly one environment variable: `WISPR_API_KEY`. The backend is selected

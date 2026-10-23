@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ruanbarroso/barroso-wispr/internal/app"
+	"github.com/ruanbarroso/barroso-wispr/internal/atualizacao"
 	"github.com/ruanbarroso/barroso-wispr/internal/config"
 	"github.com/ruanbarroso/barroso-wispr/internal/gateway"
 	"github.com/ruanbarroso/barroso-wispr/internal/plataforma"
@@ -29,6 +31,13 @@ const dicionarioInicial = `# Dicionário do barroso-wispr: um termo por linha (n
 `
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--wispr-update-helper" {
+		os.Exit(atualizacao.RunHelper(os.Args[2:]))
+	}
+	readyPath := os.Getenv("BARROSO_WISPR_UPDATE_READY")
+	if readyPath != "" {
+		_ = os.Unsetenv("BARROSO_WISPR_UPDATE_READY")
+	}
 	versao := flag.Bool("version", false, "mostra a versão")
 	arquivo := flag.String("arquivo", "", "dita um PCM s16le 16 kHz mono deste arquivo e imprime o texto (diagnóstico, sem microfone nem teclado)")
 	flag.Parse()
@@ -108,6 +117,7 @@ func main() {
 	}
 
 	teclado := &plataforma.Teclado{Pressionou: a.Pressionou, Soltou: a.Soltou, OutraTecla: a.OutraTecla}
+	a.DefinirParada(teclado.Parar)
 	go func() {
 		for range time.Tick(25 * time.Millisecond) {
 			a.Tick()
@@ -119,6 +129,32 @@ func main() {
 
 	fmt.Fprintf(log, "barroso-wispr %s — segure Ctrl+Alt para ditar (2 toques = trava). Gateway %s, voz %s, limpeza %s. Dicionário: %s. Ctrl+C sai.\n",
 		Versao, onde, dest.Modelo, dest.QuickModel, pref.Dicionario)
+	var updateCtx context.Context
+	if *arquivo == "" {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		updateCtx = ctx
+	}
+	teclado.OnReady = func() {
+		if readyPath != "" {
+			_ = os.WriteFile(readyPath, []byte("ready"), 0o600)
+		}
+		// A helper-launched candidate keeps its backup until a later normal start.
+		if readyPath == "" {
+			atualizacao.LimparBackupsAoIniciar()
+		}
+		if updateCtx != nil {
+			// O hook já está instalado: a partir daqui uma troca pedida pode
+			// encerrar o processo com segurança.
+			go atualizacao.Rodar(updateCtx, atualizacao.Deps{
+				Versao:     Versao,
+				Home:       config.Home(),
+				Log:        log,
+				Ocioso:     a.Ocioso,
+				PedirTroca: a.PedirTroca,
+			})
+		}
+	}
 	if err := teclado.Rodar(); err != nil {
 		fmt.Fprintln(os.Stderr, "barroso-wispr: hook de teclado:", err)
 		os.Exit(1)
