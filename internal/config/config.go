@@ -36,16 +36,31 @@ type Credenciais struct {
 
 // Preferencias é o config do wispr (~/.barroso-wispr/config.json).
 type Preferencias struct {
-	Modelo     string `json:"model"`       // virtual de voz (live-token)
-	QuickModel string `json:"quick_model"` // passe de limpeza
-	Dicionario string `json:"dictionary"`  // palavras-chave, uma por linha
-	ModoTrava  bool   `json:"latch_mode"`  // true depois de dois toques rápidos
+	// Provider: "barroso" (barroso-keys), "google" (AI Studio direto) ou
+	// vazio = automático (barroso se houver credencial dele, senão google).
+	Provider     string `json:"provider,omitempty"`
+	GoogleAPIKey string `json:"google_api_key,omitempty"`
+	Modelo       string `json:"model"`       // voz: virtual no barroso, real no google
+	QuickModel   string `json:"quick_model"` // passe de limpeza
+	Dicionario   string `json:"dictionary"`  // palavras-chave, uma por linha
+	ModoTrava    bool   `json:"latch_mode"`  // true depois de dois toques rápidos
 }
 
 // Defaults
 const (
 	ModeloVoz   = "barroso-audio-stream"
 	ModeloQuick = "barroso-quick"
+
+	// Sem gateway não há chain: modelo real. O transcribe-live foi o melhor
+	// da sonda de 2026-10-22 (texto final ~460 ms após o fim da fala).
+	ModeloVozGoogle   = "gemini-3.5-transcribe-live"
+	ModeloQuickGoogle = "gemini-3.5-flash-lite"
+
+	ProviderBarroso = "barroso"
+	ProviderGoogle  = "google"
+
+	EnvGeminiKey = "GEMINI_API_KEY"
+	EnvGoogleKey = "GOOGLE_API_KEY"
 )
 
 // Home é o diretório de dados do wispr.
@@ -141,26 +156,95 @@ func Cred() (Credenciais, error) {
 }
 
 // Carregar lê o config do wispr; arquivo ausente devolve os defaults.
+// Modelos vazios ficam vazios aqui: o default depende do provider (Resolver).
 func Carregar() Preferencias {
-	p := Preferencias{Modelo: ModeloVoz, QuickModel: ModeloQuick, Dicionario: filepath.Join(Home(), "dicionario.txt")}
+	p := Preferencias{Dicionario: filepath.Join(Home(), "dicionario.txt")}
 	b, err := os.ReadFile(filepath.Join(Home(), "config.json"))
 	if err != nil {
 		return p
 	}
 	var disk Preferencias
 	if json.Unmarshal(b, &disk) == nil {
-		if disk.Modelo != "" {
-			p.Modelo = disk.Modelo
-		}
-		if disk.QuickModel != "" {
-			p.QuickModel = disk.QuickModel
-		}
+		p.Provider = strings.ToLower(strings.TrimSpace(disk.Provider))
+		p.GoogleAPIKey = strings.TrimSpace(disk.GoogleAPIKey)
+		p.Modelo, p.QuickModel = disk.Modelo, disk.QuickModel
 		if disk.Dicionario != "" {
 			p.Dicionario = disk.Dicionario
 		}
 		p.ModoTrava = disk.ModoTrava
 	}
 	return p
+}
+
+// Destino é o provider escolhido, com credencial e modelos resolvidos.
+type Destino struct {
+	Provider   string // ProviderBarroso | ProviderGoogle
+	BaseURL    string // só barroso
+	APIKey     string
+	Modelo     string
+	QuickModel string
+}
+
+// chaveGoogle: config do wispr, depois GEMINI_API_KEY, depois GOOGLE_API_KEY.
+func chaveGoogle(p Preferencias) string {
+	for _, k := range []string{p.GoogleAPIKey, os.Getenv(EnvGeminiKey), os.Getenv(EnvGoogleKey)} {
+		if k = strings.TrimSpace(k); k != "" {
+			return k
+		}
+	}
+	return ""
+}
+
+// Resolver escolhe o provider. Automático: barroso-keys se houver credencial
+// dele (ambiente BARROSO_* ou config do Barroso Harness); senão Google AI
+// Studio se houver chave; senão erro explicando as duas opções.
+func Resolver(p Preferencias) (Destino, error) {
+	google := func() (Destino, error) {
+		k := chaveGoogle(p)
+		if k == "" {
+			return Destino{}, fmt.Errorf("provider google sem chave: defina %s ou google_api_key em %s",
+				EnvGeminiKey, filepath.Join(Home(), "config.json"))
+		}
+		d := Destino{Provider: ProviderGoogle, APIKey: k, Modelo: p.Modelo, QuickModel: p.QuickModel}
+		if d.Modelo == "" {
+			d.Modelo = ModeloVozGoogle
+		}
+		if d.QuickModel == "" {
+			d.QuickModel = ModeloQuickGoogle
+		}
+		return d, nil
+	}
+	barroso := func() (Destino, error) {
+		c, err := Cred()
+		if err != nil {
+			return Destino{}, err
+		}
+		d := Destino{Provider: ProviderBarroso, BaseURL: c.BaseURL, APIKey: c.APIKey, Modelo: p.Modelo, QuickModel: p.QuickModel}
+		if d.Modelo == "" {
+			d.Modelo = ModeloVoz
+		}
+		if d.QuickModel == "" {
+			d.QuickModel = ModeloQuick
+		}
+		return d, nil
+	}
+	switch p.Provider {
+	case ProviderGoogle:
+		return google()
+	case ProviderBarroso:
+		return barroso()
+	case "":
+		d, errB := barroso()
+		if errB == nil && d.APIKey != "" {
+			return d, nil
+		}
+		if chaveGoogle(p) != "" {
+			return google()
+		}
+		return Destino{}, fmt.Errorf("nenhuma credencial: use o barroso-keys (BARROSO_AUTH_TOKEN ou `barroso-harness -init`) ou o Google AI Studio (%s)", EnvGeminiKey)
+	default:
+		return Destino{}, fmt.Errorf("provider %q desconhecido (use %q ou %q)", p.Provider, ProviderBarroso, ProviderGoogle)
+	}
 }
 
 // Salvar grava o config do wispr (best effort).

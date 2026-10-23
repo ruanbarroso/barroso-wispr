@@ -56,6 +56,42 @@ func TestCredEnvSobrepoeConfig(t *testing.T) {
 	}
 }
 
+func TestResolverAutomaticoCaiNoGoogleSemBarroso(t *testing.T) {
+	t.Setenv("BARROSO_HARNESS_HOME", t.TempDir())
+	t.Setenv(EnvBaseURL, "")
+	t.Setenv(EnvAuthToken, "")
+	t.Setenv(EnvGeminiKey, "AIza-test")
+	d, err := Resolver(Preferencias{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Provider != ProviderGoogle || d.APIKey != "AIza-test" || d.Modelo != ModeloVozGoogle || d.QuickModel != ModeloQuickGoogle {
+		t.Fatalf("got %+v", d)
+	}
+}
+
+func TestResolverAutomaticoPrefereBarroso(t *testing.T) {
+	t.Setenv("BARROSO_HARNESS_HOME", t.TempDir())
+	t.Setenv(EnvBaseURL, "")
+	t.Setenv(EnvAuthToken, "bk-env")
+	t.Setenv(EnvGeminiKey, "AIza-test")
+	d, err := Resolver(Preferencias{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Provider != ProviderBarroso || d.APIKey != "bk-env" || d.Modelo != ModeloVoz {
+		t.Fatalf("got %+v", d)
+	}
+}
+
+func TestResolverGoogleExplicitoSemChaveExplica(t *testing.T) {
+	t.Setenv(EnvGeminiKey, "")
+	t.Setenv(EnvGoogleKey, "")
+	if _, err := Resolver(Preferencias{Provider: ProviderGoogle}); err == nil {
+		t.Fatal("esperava erro sem chave")
+	}
+}
+
 func TestDicionarioIgnoraBrancosEComentarios(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "dicionario.txt")
 	if err := os.WriteFile(p, []byte("# empresa\r\nBarroso\r\n\nMariana\n KIS \n"), 0o600); err != nil {

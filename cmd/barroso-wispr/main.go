@@ -37,12 +37,12 @@ func main() {
 		return
 	}
 
-	cred, err := config.Cred()
+	pref := config.Carregar()
+	dest, err := config.Resolver(pref)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "barroso-wispr:", err)
 		os.Exit(1)
 	}
-	pref := config.Carregar()
 	if _, err := os.Stat(pref.Dicionario); os.IsNotExist(err) {
 		_ = os.MkdirAll(filepath.Dir(pref.Dicionario), 0o700)
 		_ = os.WriteFile(pref.Dicionario, []byte(dicionarioInicial), 0o600)
@@ -56,7 +56,12 @@ func main() {
 		log = io.MultiWriter(os.Stderr, logf)
 	}
 
-	gw := gateway.Novo(cred.BaseURL, cred.APIKey)
+	gw := gateway.Novo(dest.BaseURL, dest.APIKey)
+	onde := dest.BaseURL
+	if dest.Provider == config.ProviderGoogle {
+		gw = gateway.NovoGoogle(dest.APIKey, dest.Modelo)
+		onde = "Google AI Studio"
+	}
 	var mic app.Microfone = &plataforma.Microfone{}
 	digitar := plataforma.Digitar
 	var feito chan struct{}
@@ -77,8 +82,8 @@ func main() {
 		Microfone:  mic,
 		Digitar:    digitar,
 		Dicionario: func() []string { return config.Dicionario(pref.Dicionario) },
-		ModeloVoz:  pref.Modelo,
-		ModeloQuik: pref.QuickModel,
+		ModeloVoz:  dest.Modelo,
+		ModeloQuik: dest.QuickModel,
 		Log:        log,
 	})
 
@@ -106,7 +111,7 @@ func main() {
 	go func() { <-sinal; teclado.Parar() }()
 
 	fmt.Fprintf(log, "barroso-wispr %s — segure Ctrl+Alt para ditar (2 toques = trava). Gateway %s, voz %s, limpeza %s. Dicionário: %s. Ctrl+C sai.\n",
-		Versao, cred.BaseURL, pref.Modelo, pref.QuickModel, pref.Dicionario)
+		Versao, onde, dest.Modelo, dest.QuickModel, pref.Dicionario)
 	if err := teclado.Rodar(); err != nil {
 		fmt.Fprintln(os.Stderr, "barroso-wispr: hook de teclado:", err)
 		os.Exit(1)

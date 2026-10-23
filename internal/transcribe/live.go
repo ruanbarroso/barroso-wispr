@@ -16,9 +16,12 @@ import (
 	"github.com/coder/websocket"
 )
 
-// URLLive é o método que aceita token efêmero: BidiGenerateContentConstrained
-// com access_token= (BidiGenerateContent com key= recusa o token).
-const URLLive = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
+// URLLive é o protocolo oficial da Gemini Live API para token efêmero:
+// BidiGenerateContentConstrained com access_token= (BidiGenerateContent com
+// key= recusa o token). v1beta é a versão documentada para tokens efêmeros —
+// vale igual para o token do barroso-keys e o do AI Studio, porque nos dois
+// casos quem emite é o mesmo /v1beta/auth_tokens do Google.
+const URLLive = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"
 
 // MimePCM é o formato que o microfone entrega.
 const MimePCM = "audio/pcm;rate=16000"
