@@ -84,10 +84,17 @@ func main() {
 		Dicionario: func() []string { return config.Dicionario(pref.Dicionario) },
 		ModeloVoz:  dest.Modelo,
 		ModeloQuik: dest.QuickModel,
+		BeepReady:  plataforma.BeepReady,
+		BeepDone:   plataforma.BeepDone,
 		Log:        log,
 	})
 
+	a.Aquecer()
+
 	if *arquivo != "" {
+		// Com o app aberto o token já está pronto quando o usuário aperta;
+		// o diagnóstico espera o aquecimento para medir esse caso real.
+		time.Sleep(3 * time.Second)
 		// Simula segurar o atalho pelo tempo do áudio e soltar.
 		dur := time.Duration(len(mic.(*app.MicArquivo).PCM)/(plataforma.TaxaAmostras*2)) * time.Second
 		a.Simular(dur + 300*time.Millisecond)

@@ -7,88 +7,63 @@ import (
 	"testing"
 )
 
-func TestCredLêProviderAtivoDoHarness(t *testing.T) {
-	t.Setenv("BARROSO_HARNESS_HOME", t.TempDir())
-	t.Setenv(EnvBaseURL, "")
-	t.Setenv(EnvAuthToken, "")
-	p := filepath.Join(os.Getenv("BARROSO_HARNESS_HOME"), "config.json")
-	data := `{"current_provider":"barroso","providers":{"barroso":{"base_url":"https://keys.example/v1","api_key":"bk-test"},"other":{"base_url":"https://other/v1","api_key":"wrong"}}}`
-	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	got, err := Cred()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.BaseURL != "https://keys.example/v1" || got.APIKey != "bk-test" {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestCredPrefereOGatewayQuandoOAtivoEOutro(t *testing.T) {
-	t.Setenv("BARROSO_HARNESS_HOME", t.TempDir())
-	t.Setenv(EnvBaseURL, "")
-	t.Setenv(EnvAuthToken, "")
-	p := filepath.Join(os.Getenv("BARROSO_HARNESS_HOME"), "config.json")
-	data := `{"current_provider":"zen","providers":{"zen":{"base_url":"https://opencode.ai/inference/openai/v1","api_key":"public"},"bk":{"base_url":"https://keys.barroso.tec.br/v1","api_key":"bk-real"}}}`
-	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	got, err := Cred()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.APIKey != "bk-real" || got.BaseURL != "https://keys.barroso.tec.br/v1" {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestCredEnvSobrepoeConfig(t *testing.T) {
-	t.Setenv("BARROSO_HARNESS_HOME", t.TempDir())
-	t.Setenv(EnvBaseURL, "https://override.example/v1")
-	t.Setenv(EnvAuthToken, "env-token")
-	got, err := Cred()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.BaseURL != "https://override.example/v1" || got.APIKey != "env-token" || !got.DeEnv {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestResolverAutomaticoCaiNoGoogleSemBarroso(t *testing.T) {
-	t.Setenv("BARROSO_HARNESS_HOME", t.TempDir())
-	t.Setenv(EnvBaseURL, "")
-	t.Setenv(EnvAuthToken, "")
-	t.Setenv(EnvGeminiKey, "AIza-test")
+func TestResolverGoogleComChaveSemPrefixoBK(t *testing.T) {
+	t.Setenv(EnvAPIKey, "AIza-test")
 	d, err := Resolver(Preferencias{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Provider != ProviderGoogle || d.APIKey != "AIza-test" || d.Modelo != ModeloVozGoogle || d.QuickModel != ModeloQuickGoogle {
+	if d.Provider != ProviderGoogle || d.APIKey != "AIza-test" || d.BaseURL != "" {
 		t.Fatalf("got %+v", d)
+	}
+	if d.Modelo != ModeloVozGoogle || d.Modelo == "" {
+		t.Fatalf("voz não fixada no melhor modelo live free-tier: %q", d.Modelo)
+	}
+	if d.QuickModel != ModeloQuickGoogle {
+		t.Fatalf("quick model %q", d.QuickModel)
 	}
 }
 
-func TestResolverAutomaticoPrefereBarroso(t *testing.T) {
-	t.Setenv("BARROSO_HARNESS_HOME", t.TempDir())
-	t.Setenv(EnvBaseURL, "")
-	t.Setenv(EnvAuthToken, "bk-env")
-	t.Setenv(EnvGeminiKey, "AIza-test")
+func TestResolverBarrosoPeloPrefixoDash(t *testing.T) {
+	t.Setenv(EnvAPIKey, "bk-livekey")
 	d, err := Resolver(Preferencias{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Provider != ProviderBarroso || d.APIKey != "bk-env" || d.Modelo != ModeloVoz {
+	if d.Provider != ProviderBarroso || d.APIKey != "bk-livekey" || d.BaseURL != DefaultBaseURL {
 		t.Fatalf("got %+v", d)
+	}
+	if d.Modelo != ModeloVozBarroso || d.QuickModel != ModeloQuickBarroso {
+		t.Fatalf("models %+v", d)
 	}
 }
 
-func TestResolverGoogleExplicitoSemChaveExplica(t *testing.T) {
-	t.Setenv(EnvGeminiKey, "")
-	t.Setenv(EnvGoogleKey, "")
-	if _, err := Resolver(Preferencias{Provider: ProviderGoogle}); err == nil {
-		t.Fatal("esperava erro sem chave")
+func TestResolverBKUnderscoreIsNotBarroso(t *testing.T) {
+	t.Setenv(EnvAPIKey, "bk_legacy")
+	d, err := Resolver(Preferencias{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Provider != ProviderGoogle || d.BaseURL != "" {
+		t.Fatalf("`bk_` must not select Barroso Keys: %+v", d)
+	}
+}
+
+func TestResolverBarrosoPeloPrefixoDashAtual(t *testing.T) {
+	t.Setenv(EnvAPIKey, "bk-livekey")
+	d, err := Resolver(Preferencias{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Provider != ProviderBarroso || d.APIKey != "bk-livekey" || d.BaseURL != DefaultBaseURL {
+		t.Fatalf("chave Barroso Keys não roteada pelo prefixo emitido: %+v", d)
+	}
+}
+
+func TestResolverExigeUmaChave(t *testing.T) {
+	t.Setenv(EnvAPIKey, "")
+	if _, err := Resolver(Preferencias{}); err == nil {
+		t.Fatal("esperava erro quando WISPR_API_KEY está ausente")
 	}
 }
 

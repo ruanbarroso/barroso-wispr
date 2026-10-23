@@ -70,6 +70,7 @@ func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
 	mic := &micFake{stopped: make(chan struct{})}
 	s := &sessaoFake{finalizou: make(chan struct{})}
 	digitado := make(chan string, 1)
+	beeps := make(chan string, 2)
 	a := Novo(Deps{
 		Gateway:   gateway.Novo(server.URL+"/v1", "test"),
 		Chat:      chatFake{},
@@ -81,6 +82,8 @@ func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
 		},
 		ModeloVoz:  "barroso-audio-stream",
 		ModeloQuik: "barroso-quick",
+		BeepReady:  func() { beeps <- "ready" },
+		BeepDone:   func() { beeps <- "done" },
 	})
 
 	// Toque 1: armar; toque 2: iniciar travado.
@@ -90,6 +93,14 @@ func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
 	a.Soltou() // soltar o segundo toque mantém a gravação travada
 
 	// Aguarda a sessão abrir, como o usuário esperaria após o segundo toque.
+	select {
+	case got := <-beeps:
+		if got != "ready" {
+			t.Fatalf("primeiro beep = %q, want ready", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("não tocou o beep de pronto")
+	}
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
@@ -110,6 +121,19 @@ func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
 	case <-mic.stopped:
 	case <-time.After(2 * time.Second):
 		t.Fatal("o novo pressionamento não parou o microfone")
+	}
+	select {
+	case got := <-beeps:
+		if got != "done" {
+			t.Fatalf("segundo beep = %q, want done", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("não tocou o beep de fim")
+	}
+	select {
+	case extra := <-beeps:
+		t.Fatalf("beep inesperado: %q", extra)
+	default:
 	}
 	select {
 	case <-s.finalizou:

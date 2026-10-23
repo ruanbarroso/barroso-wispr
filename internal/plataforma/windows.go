@@ -18,6 +18,7 @@ import (
 var (
 	user32                  = windows.NewLazySystemDLL("user32.dll")
 	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
+	procMessageBeep         = user32.NewProc("MessageBeep")
 	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
@@ -82,6 +83,12 @@ type keybdinput struct {
 	Time        uint32
 	DwExtraInfo uintptr
 }
+
+// BeepReady toca o som de sistema indicando que a Live está pronta para fala.
+func BeepReady() { procMessageBeep.Call(0x00000040) } // MB_ICONASTERISK
+
+// BeepDone toca o som de sistema indicando que a captura terminou.
+func BeepDone() { procMessageBeep.Call(0x00000030) } // MB_ICONWARNING
 
 // Teclado entrega as transições do atalho Ctrl(esquerdo)+Alt(esquerdo).
 // O AltGr (Alt direito, que o Windows reporta como LCtrl+RAlt) nunca conta.

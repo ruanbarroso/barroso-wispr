@@ -22,44 +22,41 @@ Run `barroso-wispr.exe` and leave it open. Logs go to the terminal and to
 `~/.barroso-wispr/wispr.log`. It cannot type into windows running as
 administrator unless it also runs elevated.
 
-## Providers
+## Credential setup
 
-`barroso-wispr` works with either backend. Set `provider` in
-`~/.barroso-wispr/config.json`, or leave it empty for automatic selection
-(barroso-keys if its credentials exist, otherwise Google AI Studio).
+Set exactly one environment variable: `WISPR_API_KEY`. The backend is selected
+from the key prefix; there is no URL or provider setting:
 
-### Google AI Studio (direct)
+- Keys starting with `bk_` use `https://keys.barroso.tec.br/v1`, voice model
+  `barroso-audio-stream` (the gateway selects the real chain model via
+  `x-served-model`) and cleanup model `barroso-quick`.
+- Any other key is sent to Google AI Studio. Create a key at
+  <https://aistudio.google.com/apikey>. Voice is fixed to
+  `gemini-3.5-transcribe-live`; cleanup is fixed to `gemini-3.5-flash-lite`.
+  The app mints a one-use [ephemeral token](https://ai.google.dev/gemini-api/docs/ephemeral-tokens)
+  for each dictation.
 
-```json
-{ "provider": "google" }
+```powershell
+$env:WISPR_API_KEY = "your-google-ai-studio-key"
+# or: $env:WISPR_API_KEY = "bk_your-barroso-keys-key"
 ```
 
-Key from `google_api_key` in the config, `GEMINI_API_KEY`, or `GOOGLE_API_KEY`
-(get one at <https://aistudio.google.com/apikey>). A one-use
-[ephemeral token](https://ai.google.dev/gemini-api/docs/ephemeral-tokens) is
-minted per dictation; cleanup uses Gemini's OpenAI-compatible endpoint.
-Defaults: `gemini-3.5-transcribe-live` for voice, `gemini-3.5-flash-lite` for
-cleanup.
+The Google Live transcription model was chosen from the tested candidates: it
+has free-tier input and output listed by Google and gave the best transcription
+accuracy in our 17-second pt-BR comparison. Google may change its free-tier
+availability and rate limits; see [pricing](https://ai.google.dev/gemini-api/docs/pricing).
 
-### barroso-keys gateway
+When the Live session is ready to receive speech, the app plays a ready beep.
+When capture ends, it plays a second beep before final transcription and paste.
 
-```json
-{ "provider": "barroso" }
-```
+## Preferences
 
-Credentials from `BARROSO_BASE_URL` / `BARROSO_AUTH_TOKEN`, or the
-keys.barroso.tec.br provider in the Barroso Harness config
-(`~/.barroso-harness/config.json`). Voice uses the `barroso-audio-stream`
-virtual model (fallback chain, real model in `x-served-model`); cleanup uses
-`barroso-quick`.
-
-### Other options
+The only setting in `~/.barroso-wispr/config.json` is an optional dictionary
+path. It contains no provider, key, URL, or model selection.
 
 | key           | meaning                                         |
 |---------------|-------------------------------------------------|
-| `model`       | voice model (virtual on barroso, real on google) |
-| `quick_model` | cleanup model                                   |
-| `dictionary`  | path to the dictionary file                     |
+| `dictionary` | optional path to the dictionary file |
 
 ## Dictionary
 

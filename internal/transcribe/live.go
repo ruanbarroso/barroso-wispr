@@ -190,9 +190,14 @@ func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (str
 			s.mu.Lock()
 			ultima, temTexto := s.ultima, s.texto.Len() > 0
 			s.mu.Unlock()
-			// Só conta silêncio a partir da primeira parcial pós-fim (o
-			// transcribe-live entrega o texto inteiro depois do audioStreamEnd).
-			if temTexto && ultima.After(fim) && time.Since(ultima) >= quieto {
+			// Silêncio conta a partir do mais recente entre o fim do áudio e a
+			// última parcial. Exigir parcial DEPOIS do fim travava até o teto
+			// quando a frase curta já tinha sido transcrita antes de soltar.
+			ref := fim
+			if ultima.After(ref) {
+				ref = ultima
+			}
+			if temTexto && time.Since(ref) >= quieto {
 				return s.Texto(), nil
 			}
 		}
