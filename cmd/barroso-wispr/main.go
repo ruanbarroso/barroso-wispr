@@ -63,7 +63,7 @@ func main() {
 		onde = "Google AI Studio"
 	}
 	var mic app.Microfone = &plataforma.Microfone{}
-	digitar := plataforma.Digitar
+	digitar := plataforma.Colar
 	var feito chan struct{}
 	if *arquivo != "" {
 		pcm, err := os.ReadFile(*arquivo)
