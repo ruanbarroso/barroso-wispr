@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,11 +19,15 @@ type micFake struct {
 	mu      sync.Mutex
 	active  bool
 	stopped chan struct{}
+	err     error
 }
 
 func (m *micFake) Iniciar(func([]byte)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.err != nil {
+		return m.err
+	}
 	m.active = true
 	return nil
 }
@@ -31,7 +36,9 @@ func (m *micFake) Parar() {
 	m.mu.Lock()
 	if m.active {
 		m.active = false
-		close(m.stopped)
+		if m.stopped != nil {
+			close(m.stopped)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -61,6 +68,19 @@ func (s *bloqueiaFinal) Finalizar(context.Context, time.Duration, time.Duration)
 }
 func (s *bloqueiaFinal) Uso() (int, int) { return 0, 0 }
 func (s *bloqueiaFinal) Fechar()         {}
+
+type micFalho struct {
+	iniciar chan struct{}
+	liberar chan struct{}
+	err     error
+}
+
+func (m *micFalho) Iniciar(func([]byte)) error {
+	close(m.iniciar)
+	<-m.liberar
+	return m.err
+}
+func (*micFalho) Parar() {}
 
 type chatFake struct{}
 
@@ -214,5 +234,144 @@ func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("text not pasted")
+	}
+}
+
+func TestCallbackEstadoGravacaoAcompanhaCaptura(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	estados := make(chan bool, 2)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+
+	a.comecar()
+	if got := receberEstado(t, estados); !got {
+		t.Fatal("callback inicial = false, want true após iniciar o microfone")
+	}
+
+	a.mu.Lock()
+	g := a.rec
+	a.mu.Unlock()
+	select {
+	case <-g.pronta:
+	case <-time.After(time.Second):
+		t.Fatal("session setup did not finish")
+	}
+	go a.parar(true)
+	if got := receberEstado(t, estados); got {
+		t.Fatal("callback de parada = true, want false")
+	}
+	select {
+	case <-sess.finalizou:
+	case <-time.After(time.Second):
+		t.Fatal("Live session not finalized")
+	}
+}
+
+func TestCallbackEstadoGravacaoCancelaCaptura(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	estados := make(chan bool, 2)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+
+	a.comecar()
+	if got := receberEstado(t, estados); !got {
+		t.Fatal("callback inicial = false, want true após iniciar o microfone")
+	}
+	a.mu.Lock()
+	g := a.rec
+	a.mu.Unlock()
+	select {
+	case <-g.pronta:
+	case <-time.After(time.Second):
+		t.Fatal("session setup did not finish")
+	}
+	go a.parar(false)
+	if got := receberEstado(t, estados); got {
+		t.Fatal("callback de cancelamento = true, want false")
+	}
+	select {
+	case <-sess.finalizou:
+		t.Fatal("cancelamento não deve finalizar a sessão")
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestCallbackEstadoGravacaoFalhaDeMicrofoneNotificaFalseAposIniciar(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	mic := &micFalho{iniciar: make(chan struct{}), liberar: make(chan struct{}), err: errors.New("falha de captura")}
+	a.d.Microfone = mic
+	estados := make(chan bool, 2)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+
+	go a.comecar()
+	select {
+	case <-mic.iniciar:
+	case <-time.After(time.Second):
+		t.Fatal("Iniciar não começou")
+	}
+	assertSemEstado(t, estados)
+	close(mic.liberar)
+	if got := receberEstado(t, estados); got {
+		t.Fatal("falha ao iniciar microfone notificou true")
+	}
+	assertSemEstado(t, estados)
+}
+
+func TestCallbackEstadoGravacaoNaoIncluiFinalizacaoNemColagem(t *testing.T) {
+	sess := &bloqueiaFinal{iniciou: make(chan struct{}), libera: make(chan struct{})}
+	colado := make(chan struct{})
+	a := newAppTest(t, sess, func(string) error { close(colado); return nil })
+	estados := make(chan bool, 4)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+
+	a.comecar()
+	if got := receberEstado(t, estados); !got {
+		t.Fatal("callback inicial = false, want true")
+	}
+	a.mu.Lock()
+	g := a.rec
+	a.mu.Unlock()
+	select {
+	case <-g.pronta:
+	case <-time.After(time.Second):
+		t.Fatal("session setup did not finish")
+	}
+	go a.parar(true)
+	if got := receberEstado(t, estados); got {
+		t.Fatal("callback de parada = true, want false")
+	}
+	select {
+	case <-sess.iniciou:
+	case <-time.After(time.Second):
+		t.Fatal("transcrição não começou")
+	}
+	assertSemEstado(t, estados)
+	close(sess.libera)
+	select {
+	case <-colado:
+	case <-time.After(time.Second):
+		t.Fatal("texto não foi colado")
+	}
+	assertSemEstado(t, estados)
+}
+
+func receberEstado(t *testing.T, estados <-chan bool) bool {
+	t.Helper()
+	select {
+	case estado := <-estados:
+		return estado
+	case <-time.After(time.Second):
+		t.Fatal("callback de estado de gravação não recebido")
+		return false
+	}
+}
+
+func assertSemEstado(t *testing.T, estados <-chan bool) {
+	t.Helper()
+	select {
+	case got := <-estados:
+		t.Fatalf("callback de estado tardio: %t", got)
+	case <-time.After(30 * time.Millisecond):
 	}
 }

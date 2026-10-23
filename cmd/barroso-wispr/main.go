@@ -14,11 +14,15 @@ import (
 	"os/signal"
 	"path/filepath"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/ruanbarroso/barroso-wispr/internal/app"
 	"github.com/ruanbarroso/barroso-wispr/internal/atualizacao"
 	"github.com/ruanbarroso/barroso-wispr/internal/config"
 	"github.com/ruanbarroso/barroso-wispr/internal/gateway"
+	"github.com/ruanbarroso/barroso-wispr/internal/instalacao"
 	"github.com/ruanbarroso/barroso-wispr/internal/plataforma"
 )
 
@@ -34,35 +38,52 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "--wispr-update-helper" {
 		os.Exit(atualizacao.RunHelper(os.Args[2:]))
 	}
+	os.Exit(run())
+}
+
+func run() int {
 	readyPath := os.Getenv("BARROSO_WISPR_UPDATE_READY")
 	if readyPath != "" {
 		_ = os.Unsetenv("BARROSO_WISPR_UPDATE_READY")
 	}
 	versao := flag.Bool("version", false, "mostra a versão")
+	instalar := flag.Bool("install", false, "instala o app e o inicia")
 	arquivo := flag.String("arquivo", "", "dita um PCM s16le 16 kHz mono deste arquivo e imprime o texto (diagnóstico, sem microfone nem teclado)")
 	flag.Parse()
 	if *versao {
 		fmt.Println(Versao)
-		return
+		return 0
+	}
+
+	if *instalar {
+		if err := instalacao.Install(instalacao.Deps{}); err != nil {
+			// Do not create user files before Install has checked elevation.
+			log := instalarLogSeExiste()
+			mostrarErro(log, "Não foi possível instalar o Barroso Wispr", err)
+			return 1
+		}
+		return 0 // Install launched the installed copy; do not launch this source copy.
+	}
+
+	_ = os.MkdirAll(config.Home(), 0o700)
+	logf, logErr := os.OpenFile(filepath.Join(config.Home(), "wispr.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	var log io.Writer = io.Discard
+	if logErr == nil {
+		defer logf.Close()
+		log = logf
+	} else {
+		mostrarMensagem("Barroso Wispr", "Não foi possível abrir wispr.log.\n\n"+logErr.Error())
 	}
 
 	pref := config.Carregar()
 	dest, err := config.Resolver(pref)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "barroso-wispr:", err)
-		os.Exit(1)
+		mostrarErro(log, "Não foi possível iniciar o Barroso Wispr", err)
+		return 1
 	}
 	if _, err := os.Stat(pref.Dicionario); os.IsNotExist(err) {
 		_ = os.MkdirAll(filepath.Dir(pref.Dicionario), 0o700)
 		_ = os.WriteFile(pref.Dicionario, []byte(dicionarioInicial), 0o600)
-	}
-
-	_ = os.MkdirAll(config.Home(), 0o700)
-	logf, _ := os.OpenFile(filepath.Join(config.Home(), "wispr.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	var log io.Writer = os.Stderr
-	if logf != nil {
-		defer logf.Close()
-		log = io.MultiWriter(os.Stderr, logf)
 	}
 
 	gw := gateway.Novo(dest.BaseURL, dest.APIKey)
@@ -77,14 +98,24 @@ func main() {
 	if *arquivo != "" {
 		pcm, err := os.ReadFile(*arquivo)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "barroso-wispr:", err)
-			os.Exit(1)
+			mostrarErro(log, "Não foi possível ler o arquivo de áudio", err)
+			return 1
 		}
 		mic = &app.MicArquivo{PCM: pcm, Bloco: plataforma.BlocoBytes}
 		feito = make(chan struct{})
 		digitar = func(s string) error { fmt.Println(s); close(feito); return nil }
 	}
-	a := app.Novo(app.Deps{
+	var indicador *plataforma.Indicador
+	if *arquivo == "" {
+		indicador = plataforma.NewIndicador()
+		if err := indicador.Start(); err != nil {
+			mostrarErro(log, "Não foi possível iniciar o indicador de gravação", err)
+			return 1
+		}
+		defer indicador.Close()
+	}
+
+	deps := app.Deps{
 		Gateway:    gw,
 		Chat:       gw,
 		Abrir:      app.AbrirLive,
@@ -96,7 +127,11 @@ func main() {
 		BeepReady:  plataforma.BeepReady,
 		BeepDone:   plataforma.BeepDone,
 		Log:        log,
-	})
+	}
+	if indicador != nil {
+		deps.EstadoGravacao = indicador.SetActive
+	}
+	a := app.Novo(deps)
 
 	a.Aquecer()
 
@@ -110,10 +145,11 @@ func main() {
 		select {
 		case <-feito:
 		case <-time.After(30 * time.Second):
-			fmt.Fprintln(os.Stderr, "barroso-wispr: sem texto em 30 s")
-			os.Exit(1)
+			err := fmt.Errorf("sem texto em 30 s")
+			mostrarErro(log, "A transcrição não foi concluída", err)
+			return 1
 		}
-		return
+		return 0
 	}
 
 	teclado := &plataforma.Teclado{Pressionou: a.Pressionou, Soltou: a.Soltou, OutraTecla: a.OutraTecla}
@@ -156,7 +192,49 @@ func main() {
 		}
 	}
 	if err := teclado.Rodar(); err != nil {
-		fmt.Fprintln(os.Stderr, "barroso-wispr: hook de teclado:", err)
-		os.Exit(1)
+		mostrarErro(log, "Não foi possível iniciar o atalho global de teclado", err)
+		return 1
 	}
+	return 0
+}
+
+const (
+	mbOK            = 0x00000000
+	mbIconError     = 0x00000010
+	mbSetForeground = 0x00010000
+)
+
+var procMessageBoxW = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
+
+func mostrarMensagem(titulo, mensagem string) {
+	t, _ := windows.UTF16PtrFromString(titulo)
+	m, _ := windows.UTF16PtrFromString(mensagem)
+	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), mbOK|mbIconError|mbSetForeground)
+}
+
+func instalarLogSeExiste() io.Writer {
+	f, err := os.OpenFile(filepath.Join(config.Home(), "wispr.log"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return io.Discard
+	}
+	defer f.Close()
+	return logWriter{path: filepath.Join(config.Home(), "wispr.log")}
+}
+
+type logWriter struct{ path string }
+
+func (w logWriter) Write(p []byte) (int, error) {
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return f.Write(p)
+}
+
+func mostrarErro(log io.Writer, mensagem string, err error) {
+	if log != nil {
+		fmt.Fprintf(log, "barroso-wispr: %s: %v\n", mensagem, err)
+	}
+	mostrarMensagem("Barroso Wispr", mensagem+".\n\n"+err.Error())
 }

@@ -6,7 +6,7 @@
   "version_var": "main.Versao",
   "vet": true,
   "targets": [
-    { "package": "./cmd/barroso-wispr", "name": "barroso-wispr-windows-amd64.exe", "goos": "windows", "goarch": "amd64" },
-    { "package": "./cmd/barroso-wispr", "name": "barroso-wispr-windows-arm64.exe", "goos": "windows", "goarch": "arm64" }
+    { "package": "./cmd/barroso-wispr", "name": "barroso-wispr-windows-amd64.exe", "goos": "windows", "goarch": "amd64", "gui": true },
+    { "package": "./cmd/barroso-wispr", "name": "barroso-wispr-windows-arm64.exe", "goos": "windows", "goarch": "arm64", "gui": true }
   ]
 }

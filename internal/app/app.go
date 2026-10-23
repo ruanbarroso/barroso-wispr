@@ -31,17 +31,18 @@ type Sessao interface {
 
 // Deps são as dependências injetáveis (o teste troca todas).
 type Deps struct {
-	Gateway    *gateway.Cliente
-	Chat       limpeza.Chat
-	Abrir      func(ctx context.Context, token, modeloReal, instrucao string) (Sessao, error)
-	Microfone  Microfone
-	Digitar    func(string) error
-	Dicionario func() []string
-	ModeloVoz  string
-	ModeloQuik string
-	Log        io.Writer
-	BeepReady  func()
-	BeepDone   func()
+	Gateway        *gateway.Cliente
+	Chat           limpeza.Chat
+	Abrir          func(ctx context.Context, token, modeloReal, instrucao string) (Sessao, error)
+	Microfone      Microfone
+	Digitar        func(string) error
+	Dicionario     func() []string
+	ModeloVoz      string
+	ModeloQuik     string
+	Log            io.Writer
+	BeepReady      func()
+	BeepDone       func()
+	EstadoGravacao func(bool)
 }
 
 // App mantém a máquina do atalho e a gravação em curso.
@@ -128,9 +129,39 @@ type gravacao struct {
 	err      error
 	mu       sync.Mutex
 	pendente [][]byte // áudio capturado antes de a sessão abrir
+	// captureMu/capturando controlam o callback de estado da captura, isolado
+	// do beep: o microfone já desligou, mas a finalização/colagem ainda segue.
+	captureMu              sync.Mutex
+	capturando             bool
+	capturaEncerrada       bool
+	capturaFalsaNotificada bool
 }
 
 func Novo(d Deps) *App { return &App{d: d} }
+
+// notificarEstadoGravacao acompanha apenas a captura, não a transcrição nem
+// a colagem. O callback é serializado com o estado para impedir que um início
+// tardio reative uma gravação já encerrada.
+func (a *App) notificarEstadoGravacao(g *gravacao, ativo bool) bool {
+	g.captureMu.Lock()
+	defer g.captureMu.Unlock()
+	if ativo {
+		if g.capturaEncerrada || g.capturando {
+			return false
+		}
+		g.capturando = true
+	} else {
+		if g.capturaEncerrada {
+			return false
+		}
+		g.capturaEncerrada = true
+		g.capturando = false
+	}
+	if a.d.EstadoGravacao != nil {
+		a.d.EstadoGravacao(ativo)
+	}
+	return true
+}
 
 // PedirTroca agenda f (que encerra o processo para a versão nova) para o
 // primeiro momento em que nenhum ditado estiver em curso — inclusive a
@@ -263,10 +294,16 @@ func (a *App) comecar() {
 	})
 	if err != nil {
 		a.logf("microfone: %v", err)
-	} else if a.d.BeepReady != nil {
-		// O microfone já grava desde aqui; o áudio fica em buffer até a sessão
-		// abrir. Então já dá para falar — não precisa esperar a conexão.
-		a.d.BeepReady()
+		a.notificarEstadoGravacao(g, false)
+	} else {
+		if !a.notificarEstadoGravacao(g, true) {
+			// A gravação pode ter sido encerrada enquanto Iniciar ainda rodava.
+			a.d.Microfone.Parar()
+		} else if a.d.BeepReady != nil {
+			// O microfone já grava desde aqui; o áudio fica em buffer até a sessão
+			// abrir. Então já dá para falar — não precisa esperar a conexão.
+			a.d.BeepReady()
+		}
 	}
 
 	go func() {
@@ -319,6 +356,7 @@ func (a *App) parar(entregar bool) {
 	// Depois de um ditado costuma vir outro: deixa o próximo token pronto.
 	defer a.Aquecer()
 	a.d.Microfone.Parar()
+	a.notificarEstadoGravacao(g, false)
 	if a.d.BeepDone != nil {
 		a.d.BeepDone()
 	}
