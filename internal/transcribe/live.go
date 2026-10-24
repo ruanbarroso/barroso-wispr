@@ -61,6 +61,10 @@ type quadro struct {
 			Text string `json:"text"`
 		} `json:"inputTranscription"`
 		TurnComplete bool `json:"turnComplete"`
+		// O gemini-3.5-transcribe-live não manda turnComplete: depois do
+		// audioStreamEnd ele entrega a última parcial e, junto, generationComplete
+		// (medido em 2026-10-24, ~0,7 s após o fim de 47 s de fala).
+		GenerationComplete bool `json:"generationComplete"`
 	} `json:"serverContent"`
 	UsageMetadata *struct {
 		PromptTokenCount   int `json:"promptTokenCount"`
@@ -77,7 +81,7 @@ type Sessao struct {
 	mu       sync.Mutex
 	texto    strings.Builder
 	ultima   time.Time // hora da última parcial recebida
-	turno    time.Time // hora do último turnComplete do servidor
+	turno    time.Time // hora do último fim de geração/turno do servidor
 	entrada  int
 	saida    int
 	erroLeit error
@@ -159,7 +163,7 @@ func (s *Sessao) ler() {
 			}
 			s.mu.Lock()
 		}
-		if q.ServerContent != nil && q.ServerContent.TurnComplete {
+		if q.ServerContent != nil && (q.ServerContent.TurnComplete || q.ServerContent.GenerationComplete) {
 			s.turno = time.Now()
 		}
 		if u := q.UsageMetadata; u != nil {
@@ -180,13 +184,14 @@ func (s *Sessao) EnviarAudio(ctx context.Context, pcm []byte) error {
 	return s.conn.Write(ctx, websocket.MessageText, b)
 }
 
-// folgaTurno é quanto esperar, depois do turnComplete que chega após o fim do
+// folgaTurno é quanto esperar, depois do sinal de fim que chega após o fim do
 // áudio, por alguma parcial atrasada antes de devolver o texto.
 const folgaTurno = 300 * time.Millisecond
 
-// Finalizar avisa o fim do áudio e espera a transcrição assentar. Devolve
-// quando o servidor fecha o turno depois do fim (mais uma folga curta), quando
-// passa `quieto` sem parcial nova depois do fim, ou no `teto`.
+// Finalizar avisa o fim do áudio e espera a transcrição assentar. O caminho
+// normal é o sinal do servidor: generationComplete (ou turnComplete) depois
+// do audioStreamEnd, mais uma folga curta. Sem esse sinal, devolve quando passa
+// `quieto` sem parcial nova depois do fim, ou no `teto`.
 //
 // O silêncio conta a partir do mais recente entre o fim do áudio e a última
 // parcial, e quem chama aumenta `quieto` com a duração da gravação: em fala

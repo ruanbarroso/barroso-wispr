@@ -49,7 +49,8 @@ func servidorLive(t *testing.T, antes, depois []string, atraso time.Duration, tu
 			parcial(s)
 		}
 		if turno {
-			escrever(map[string]any{"serverContent": map[string]any{"turnComplete": true}})
+			// Como a Live real: generationComplete, sem turnComplete.
+			escrever(map[string]any{"serverContent": map[string]any{"generationComplete": true}})
 		}
 		_, _, _ = c.Read(ctx) // espera o cliente fechar
 	}))
@@ -84,7 +85,7 @@ func TestFinalizarEsperaOFimQueChegaDepois(t *testing.T) {
 	}
 }
 
-// Com turnComplete depois do fim do áudio, não espera o silêncio inteiro.
+// Com generationComplete depois do fim do áudio, não espera o silêncio inteiro.
 func TestFinalizarVoltaLogoQueOTurnoFecha(t *testing.T) {
 	s := servidorLive(t, []string{"Frase curta"}, []string{"."}, 50*time.Millisecond, true)
 	t0 := time.Now()
