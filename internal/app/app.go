@@ -257,42 +257,75 @@ func (a *App) Tick() {
 	a.tratar(a.comMaq(func(m *atalho.Maquina) atalho.Evento { return m.Tick(time.Now()) }))
 }
 
-func (a *App) comMaq(f func(*atalho.Maquina) atalho.Evento) atalho.Evento {
+// acao é o que o atalho decidiu, já aplicado ao estado do app: a gravação
+// que começou (reservada em a.rec) ou a que foi retirada de a.rec para parar.
+type acao struct {
+	comecar  *gravacao
+	parar    *gravacao
+	entregar bool
+}
+
+// comMaq decide e aplica o evento do atalho sob o MESMO lock: a máquina do
+// atalho e a.rec nunca discordam. Antes, Tick (outra goroutine) e Soltou
+// decidiam sob o lock mas só registravam a gravação depois de soltá-lo; com
+// toques rápidos o Parar corria antes de o Comecar registrar a gravação, não
+// achava nada, e a gravação ficava ligada com o atalho achando que estava
+// ocioso — nenhum toque a desligava.
+func (a *App) comMaq(f func(*atalho.Maquina) atalho.Evento) acao {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.trocando {
-		return atalho.Nada
+		return acao{}
 	}
+	gravandoAntes := a.maq.Gravando()
 	e := f(&a.maq)
-	// Com troca pedida, deixa terminar o ditado em curso (Parar/Cancelar
-	// passam), mas não começa outro.
-	if e == atalho.Comecar && a.trocaPed {
-		a.maq.Reset()
-		return atalho.Nada
-	}
-	return e
-}
-
-func (a *App) tratar(e atalho.Evento) {
 	switch e {
 	case atalho.Comecar:
-		a.comecar()
-	case atalho.Parar:
-		go a.parar(true)
-	case atalho.Cancelar:
-		go a.parar(false)
+		if a.trocaPed {
+			// Com troca pedida, deixa terminar o ditado em curso, mas não começa outro.
+			a.maq.Reset()
+			return acao{}
+		}
+		if a.rec != nil {
+			// Rede de segurança: o atalho achava que não havia gravação, mas
+			// havia. O gesto de começar encerra a que está ligada.
+			a.maq.Reset()
+			return a.retirarRec(true)
+		}
+		return acao{comecar: a.reservar()}
+	case atalho.Parar, atalho.Cancelar:
+		return a.retirarRec(e == atalho.Parar)
+	}
+	// Rede de segurança: um toque com o atalho ocioso e uma gravação ligada
+	// (não deveria acontecer) encerra a gravação em vez de ser ignorado.
+	if !gravandoAntes && !a.maq.Gravando() && a.rec != nil && e == atalho.Nada && a.maq.Apertado() {
+		a.maq.Reset()
+		return a.retirarRec(true)
+	}
+	return acao{}
+}
+
+// retirarRec tira a gravação em curso de a.rec; a.mu deve estar travado.
+func (a *App) retirarRec(entregar bool) acao {
+	g := a.rec
+	a.rec = nil
+	if g == nil {
+		return acao{}
+	}
+	return acao{parar: g, entregar: entregar}
+}
+
+func (a *App) tratar(x acao) {
+	if x.parar != nil {
+		go a.encerrar(x.parar, x.entregar)
+	}
+	if x.comecar != nil {
+		a.iniciar(x.comecar)
 	}
 }
 
-// comecar liga o microfone NA HORA e abre a sessão em paralelo: o áudio do
-// primeiro meio segundo fica em buffer e é enviado quando o setup completa,
-// para não perder a primeira palavra.
-func (a *App) comecar() {
-	a.mu.Lock()
-	if a.rec != nil || a.trocaPed || a.trocando {
-		a.mu.Unlock()
-		return
-	}
+// reservar cria a gravação e a registra em a.rec; a.mu deve estar travado.
+func (a *App) reservar() *gravacao {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	g := &gravacao{ctx: ctx, cancel: cancel, inicio: time.Now(), pronta: make(chan struct{})}
 	if a.lote == nil {
@@ -302,7 +335,26 @@ func (a *App) comecar() {
 	a.lote.partes = append(a.lote.partes, "")
 	a.rec = g
 	a.ativos++
+	return g
+}
+
+// comecar reserva e inicia uma gravação fora do atalho (diagnóstico e testes).
+func (a *App) comecar() {
+	a.mu.Lock()
+	if a.rec != nil || a.trocaPed || a.trocando {
+		a.mu.Unlock()
+		return
+	}
+	g := a.reservar()
 	a.mu.Unlock()
+	a.iniciar(g)
+}
+
+// iniciar liga o microfone NA HORA e abre a sessão em paralelo: o áudio do
+// primeiro meio segundo fica em buffer e é enviado quando o setup completa,
+// para não perder a primeira palavra.
+func (a *App) iniciar(g *gravacao) {
+	ctx := g.ctx
 	err := a.d.Microfone.Iniciar(func(pcm []byte) {
 		b := append([]byte(nil), pcm...)
 		g.mu.Lock()

@@ -418,9 +418,81 @@ func TestHandoffFailureResetsHotkey(t *testing.T) {
 		t.Fatal("failed handoff started a recording")
 	}
 	a.comMaq(func(m *atalho.Maquina) atalho.Evento { return m.Pressionou(time.Now()) })
-	if e := a.comMaq(func(m *atalho.Maquina) atalho.Evento { return m.Tick(time.Now().Add(atalho.Segurar)) }); e != atalho.Comecar {
-		t.Fatalf("hotkey did not recover after failed handoff: %v", e)
+	x := a.comMaq(func(m *atalho.Maquina) atalho.Evento { return m.Tick(time.Now().Add(atalho.Segurar)) })
+	if x.comecar == nil {
+		t.Fatal("hotkey did not recover after failed handoff")
 	}
+}
+
+// TestToqueRapidoNaoDeixaGravacaoLigada reproduz o caso que travou a máquina:
+// três toques rápidos Ctrl+Alt, o último dado enquanto o timer ainda estava no
+// meio da promoção apertado→gravando. O sintoma era a gravação ficar ligada
+// com o atalho ocioso, sem nenhum toque a desligar.
+func TestToqueRapidoNaoDeixaGravacaoLigada(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	a.DefinirParada(func() {})
+
+	// Toque 1: pressiona e solta antes de 200 ms (toque curto, vira candidato a travamento).
+	a.Pressionou()
+	a.Soltou()
+	// Toque 2: dentro da janela, trava e começa a gravar.
+	a.Pressionou()
+	a.Soltou()
+	// Toque 3: no estado travado, um Pressionou encerra a gravação.
+	a.Pressionou()
+	a.Soltou()
+
+	for i := 0; i < 40; i++ {
+		a.Tick()
+		time.Sleep(10 * time.Millisecond)
+	}
+	a.mu.Lock()
+	rec := a.rec
+	gravando := a.maq.Gravando()
+	a.mu.Unlock()
+	if rec != nil {
+		t.Fatal("recording left active after rapid taps")
+	}
+	if gravando {
+		t.Fatal("hotkey still reporting a recording after rapid taps")
+	}
+}
+
+// TestRecAtivaComAtalhoOciosoEncerraNoProximoToque é a rede de segurança: se
+// por alguma corrida a gravação ficar ligada com o atalho ocioso, um toque
+// simples tem de encerrá-la em vez de ser ignorado.
+func TestRecAtivaComAtalhoOciosoEncerraNoProximoToque(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+
+	// Simula a divergência: gravação ligada, máquina do atalho em ocioso.
+	a.mu.Lock()
+	g := a.reservar()
+	a.mu.Unlock()
+	a.iniciar(g)
+
+	<-g.pronta
+	a.mu.Lock()
+	if a.maq.Gravando() || a.rec == nil {
+		a.mu.Unlock()
+		t.Fatal("precondition failed: want leftover recording with idle hotkey")
+	}
+	a.mu.Unlock()
+
+	// Um toque simples: a rede de segurança encerra a gravação que sobrou.
+	a.Pressionou()
+	limite := time.Now().Add(2 * time.Second)
+	for time.Now().Before(limite) {
+		a.mu.Lock()
+		rec := a.rec
+		a.mu.Unlock()
+		if rec == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("next tap did not end the leftover recording")
 }
 
 func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
