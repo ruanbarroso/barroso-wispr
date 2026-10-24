@@ -90,12 +90,12 @@ type keybdinput struct {
 
 // BeepReady plays a soft two-note chime when capture starts.
 func BeepReady() {
-	playTones([]tone{{frequency: 523, duration: 105 * time.Millisecond, level: 0.035}, {frequency: 659, duration: 125 * time.Millisecond, level: 0.035}})
+	playTones([]tone{{frequency: 523, duration: 105 * time.Millisecond, level: 0.05}, {frequency: 659, duration: 125 * time.Millisecond, level: 0.05}})
 }
 
 // BeepDone plays a soft descending chime when capture ends.
 func BeepDone() {
-	playTones([]tone{{frequency: 587, duration: 95 * time.Millisecond, level: 0.032}, {frequency: 494, duration: 120 * time.Millisecond, level: 0.032}})
+	playTones([]tone{{frequency: 587, duration: 95 * time.Millisecond, level: 0.046}, {frequency: 494, duration: 120 * time.Millisecond, level: 0.046}})
 }
 
 // EstadoProcessando liga ou desliga um pulso discreto durante a transcrição,
@@ -138,7 +138,7 @@ func (p *pulso) tocar(g uint64) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	for p.vigente(g) {
-		playTones([]tone{{frequency: 440, duration: 75 * time.Millisecond, level: 0.022}})
+		playTones([]tone{{frequency: 440, duration: 75 * time.Millisecond, level: 0.03}})
 		for n := 0; n < 10 && p.vigente(g); n++ {
 			time.Sleep(100 * time.Millisecond)
 		}
