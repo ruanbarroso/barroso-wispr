@@ -142,6 +142,17 @@ func TestQuedaDaConexaoEncerraAvisaEColaOParcial(t *testing.T) {
 	}
 }
 
+func TestEsperaFinalCresceComAGravacao(t *testing.T) {
+	q1, t1 := esperaFinal(3 * time.Second)
+	q2, t2 := esperaFinal(95 * time.Second)
+	if q1 < time.Second || q2 <= q1 || t2 <= t1 {
+		t.Fatalf("curta=(%v,%v) longa=(%v,%v)", q1, t1, q2, t2)
+	}
+	if q2 > 4*time.Second || t2 > 30*time.Second {
+		t.Fatalf("longa passou do teto: (%v,%v)", q2, t2)
+	}
+}
+
 type chatEco struct{}
 
 func (chatEco) Chat(_ context.Context, _, _, cru string) (string, error) { return cru, nil }

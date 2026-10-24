@@ -77,6 +77,7 @@ type Sessao struct {
 	mu       sync.Mutex
 	texto    strings.Builder
 	ultima   time.Time // hora da última parcial recebida
+	turno    time.Time // hora do último turnComplete do servidor
 	entrada  int
 	saida    int
 	erroLeit error
@@ -158,6 +159,9 @@ func (s *Sessao) ler() {
 			}
 			s.mu.Lock()
 		}
+		if q.ServerContent != nil && q.ServerContent.TurnComplete {
+			s.turno = time.Now()
+		}
 		if u := q.UsageMetadata; u != nil {
 			// Uso é POR TURNO: soma-se. Pensamento é cobrado como saída.
 			s.entrada += u.PromptTokenCount
@@ -176,8 +180,18 @@ func (s *Sessao) EnviarAudio(ctx context.Context, pcm []byte) error {
 	return s.conn.Write(ctx, websocket.MessageText, b)
 }
 
-// Finalizar avisa o fim do áudio e espera a transcrição assentar: devolve
-// quando passa `quieto` sem parcial nova depois do fim, ou no `teto`.
+// folgaTurno é quanto esperar, depois do turnComplete que chega após o fim do
+// áudio, por alguma parcial atrasada antes de devolver o texto.
+const folgaTurno = 300 * time.Millisecond
+
+// Finalizar avisa o fim do áudio e espera a transcrição assentar. Devolve
+// quando o servidor fecha o turno depois do fim (mais uma folga curta), quando
+// passa `quieto` sem parcial nova depois do fim, ou no `teto`.
+//
+// O silêncio conta a partir do mais recente entre o fim do áudio e a última
+// parcial, e quem chama aumenta `quieto` com a duração da gravação: em fala
+// longa o modelo ainda transcreve os últimos segundos depois do fim, e um
+// `quieto` curto devolvia só o começo do ditado.
 func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (string, error) {
 	b, _ := json.Marshal(map[string]any{"realtimeInput": map[string]any{"audioStreamEnd": true}})
 	s.mu.Lock()
@@ -201,16 +215,19 @@ func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (str
 			return s.Texto(), nil
 		case <-tick.C:
 			s.mu.Lock()
-			ultima, temTexto := s.ultima, s.texto.Len() > 0
+			ultima, turno, temTexto := s.ultima, s.turno, s.texto.Len() > 0
 			s.mu.Unlock()
-			// Silêncio conta a partir do mais recente entre o fim do áudio e a
-			// última parcial. Exigir parcial DEPOIS do fim travava até o teto
-			// quando a frase curta já tinha sido transcrita antes de soltar.
 			ref := fim
 			if ultima.After(ref) {
 				ref = ultima
 			}
-			if temTexto && time.Since(ref) >= quieto {
+			if !temTexto {
+				continue
+			}
+			if turno.After(fim) && time.Since(ref) >= folgaTurno && time.Since(turno) >= folgaTurno {
+				return s.Texto(), nil
+			}
+			if time.Since(ref) >= quieto {
 				return s.Texto(), nil
 			}
 		}

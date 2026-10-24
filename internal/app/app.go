@@ -442,7 +442,8 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 		a.reportarUso(g)
 		return
 	}
-	cru, err := s.Finalizar(g.ctx, 700*time.Millisecond, 8*time.Second)
+	quieto, teto := esperaFinal(solto.Sub(g.inicio))
+	cru, err := s.Finalizar(g.ctx, quieto, teto)
 	a.reportarUso(g)
 	if err != nil && cru == "" {
 		a.logf("transcrição: %v", err)
@@ -461,6 +462,22 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 	if err := a.d.Digitar(final); err != nil {
 		a.logf("digitar: %v", err)
 	}
+}
+
+// esperaFinal dá o silêncio e o teto da espera pela transcrição final,
+// crescendo com a duração da gravação. Com 0,7 s fixo, um ditado de 33 s ou
+// 1min35s voltava cortado: o modelo ainda transcrevia o fim quando o app
+// considerava o texto pronto.
+func esperaFinal(gravado time.Duration) (quieto, teto time.Duration) {
+	quieto = 1200*time.Millisecond + gravado/20
+	if quieto > 4*time.Second {
+		quieto = 4 * time.Second
+	}
+	teto = 8*time.Second + gravado/4
+	if teto > 30*time.Second {
+		teto = 30 * time.Second
+	}
+	return quieto, teto
 }
 
 func (a *App) reportarUso(g *gravacao) {
