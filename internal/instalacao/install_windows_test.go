@@ -23,7 +23,69 @@ func testDeps(t *testing.T) (Deps, string, string) {
 		Source:       func() (string, error) { return source, nil },
 		ProgramFiles: func() (string, error) { return programFiles, nil },
 		CurrentUser:  func() (string, error) { return "S-1-5-21-123-456-789-1001", nil },
+		Ops:          Operations{StopRunning: func(string) error { return nil }},
 	}, source, programFiles
+}
+
+// Reinstalar por cima de uma instalação cujo backup sobrou (a cópia antiga
+// estava aberta) não pode falhar: era o "refusing to overwrite existing
+// rollback file" visto em 2026-10-24.
+func TestReinstallWithLeftoverBackupStopsOldCopyAndSucceeds(t *testing.T) {
+	deps, _, programFiles := testDeps(t)
+	dir := filepath.Join(programFiles, "Barroso Wispr")
+	target := filepath.Join(dir, ExecutableName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("previous"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+".install-backup", []byte("older"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	deps.Ops.StopRunning = func(d string) error {
+		if d != dir {
+			t.Fatalf("StopRunning dir = %q, want %q", d, dir)
+		}
+		got, _ := os.ReadFile(target)
+		if string(got) != "previous" {
+			t.Fatal("old copy stopped after the executable was already replaced")
+		}
+		order = append(order, "stop")
+		return nil
+	}
+	deps.Ops.RegisterTask = func(string, string) error { return nil }
+	deps.Ops.Launch = func(string, []string, string) error { order = append(order, "launch"); return nil }
+	if err := Install(deps); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(order, ",") != "stop,launch" {
+		t.Fatalf("order = %v, want stop before launch", order)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != "installer-binary" {
+		t.Fatalf("installed = %q, %v", got, err)
+	}
+	if left, _ := filepath.Glob(target + ".install-backup*"); len(left) != 0 {
+		t.Fatalf("backups left behind: %v", left)
+	}
+}
+
+func TestInstallFailsWhenOldCopyCannotBeStopped(t *testing.T) {
+	deps, _, programFiles := testDeps(t)
+	deps.Ops.StopRunning = func(string) error { return errors.New("access denied") }
+	launched := false
+	deps.Ops.Launch = func(string, []string, string) error { launched = true; return nil }
+	if err := Install(deps); err == nil || !strings.Contains(err.Error(), "stop running") {
+		t.Fatalf("Install error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(programFiles, "Barroso Wispr", ExecutableName)); !os.IsNotExist(err) {
+		t.Fatalf("executable installed despite running copy: %v", err)
+	}
+	if launched {
+		t.Fatal("launched despite running copy")
+	}
 }
 
 func TestInstallFailsFastWithoutElevation(t *testing.T) {
