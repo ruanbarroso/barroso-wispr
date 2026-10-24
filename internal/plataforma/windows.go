@@ -8,7 +8,9 @@ package plataforma
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf16"
 	"unsafe"
 
@@ -19,6 +21,7 @@ var (
 	user32                  = windows.NewLazySystemDLL("user32.dll")
 	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
 	procMessageBeep         = user32.NewProc("MessageBeep")
+	procBeep                = kernel32.NewProc("Beep")
 	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
@@ -84,11 +87,80 @@ type keybdinput struct {
 	DwExtraInfo uintptr
 }
 
-// BeepReady toca o som de sistema indicando que a Live está pronta para fala.
-func BeepReady() { procMessageBeep.Call(0x00000040) } // MB_ICONASTERISK
+// BeepReady plays a soft rising two-note chime when capture starts.
+func BeepReady() {
+	playTones([]tone{{frequency: 660, duration: 65 * time.Millisecond}, {frequency: 880, duration: 85 * time.Millisecond}})
+}
 
-// BeepDone toca o som de sistema indicando que a captura terminou.
-func BeepDone() { procMessageBeep.Call(0x00000030) } // MB_ICONWARNING
+// BeepDone plays a soft descending two-note chime when capture ends.
+func BeepDone() {
+	playTones([]tone{{frequency: 740, duration: 55 * time.Millisecond}, {frequency: 587, duration: 80 * time.Millisecond}})
+}
+
+// EstadoProcessando liga ou desliga um pulso curto e grave que se repete
+// enquanto a transcrição, a limpeza e a colagem estão em andamento.
+func EstadoProcessando(ativo bool) { processando.definir(ativo) }
+
+// pulso toca enquanto ativo; geracao impede que o laço de um ditado anterior
+// continue tocando depois de desligado e religado rapidamente.
+type pulso struct {
+	mu      sync.Mutex
+	ativo   bool
+	geracao uint64
+}
+
+var processando pulso
+
+func (p *pulso) definir(ativo bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ativo == p.ativo {
+		return
+	}
+	p.ativo = ativo
+	p.geracao++
+	if ativo {
+		go p.tocar(p.geracao)
+	}
+}
+
+func (p *pulso) vigente(g uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ativo && p.geracao == g
+}
+
+func (p *pulso) tocar(g uint64) {
+	// Espera um pouco antes do primeiro pulso para não colar no tom de fim.
+	for n := 0; n < 4; n++ {
+		if !p.vigente(g) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for p.vigente(g) {
+		procBeep.Call(523, 35) // dó5, curto e baixo
+		for n := 0; n < 7 && p.vigente(g); n++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+type tone struct {
+	frequency uint32
+	duration  time.Duration
+}
+
+func playTones(tones []tone) {
+	go func() {
+		for _, note := range tones {
+			if note.frequency < 37 || note.frequency > 32767 || note.duration <= 0 {
+				continue
+			}
+			procBeep.Call(uintptr(note.frequency), uintptr(note.duration/time.Millisecond))
+		}
+	}()
+}
 
 // Teclado entrega as transições do atalho Ctrl(esquerdo)+Alt(esquerdo).
 // O AltGr (Alt direito, que o Windows reporta como LCtrl+RAlt) nunca conta.

@@ -356,6 +356,53 @@ func TestCallbackEstadoGravacaoNaoIncluiFinalizacaoNemColagem(t *testing.T) {
 	assertSemEstado(t, estados)
 }
 
+func TestEstadoProcessandoCobreDoFimDaGravacaoAteAColagem(t *testing.T) {
+	sess := &bloqueiaFinal{iniciou: make(chan struct{}), libera: make(chan struct{})}
+	colando := make(chan struct{})
+	liberaColagem := make(chan struct{})
+	a := newAppTest(t, sess, func(string) error { close(colando); <-liberaColagem; return nil })
+	estados := make(chan bool, 4)
+	a.d.EstadoProcessando = func(ativo bool) { estados <- ativo }
+
+	a.comecar()
+	assertSemEstado(t, estados) // gravando ainda não é processar
+	go a.parar(true)
+	if got := receberEstado(t, estados); !got {
+		t.Fatal("processamento não começou ao fim da gravação")
+	}
+	select {
+	case <-sess.iniciou:
+	case <-time.After(time.Second):
+		t.Fatal("transcrição não começou")
+	}
+	close(sess.libera)
+	select {
+	case <-colando:
+	case <-time.After(time.Second):
+		t.Fatal("colagem não começou")
+	}
+	assertSemEstado(t, estados) // continua processando durante a colagem
+	close(liberaColagem)
+	if got := receberEstado(t, estados); got {
+		t.Fatal("processamento não terminou após a colagem")
+	}
+}
+
+func TestEstadoProcessandoNaoTocaNoCancelamento(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	estados := make(chan bool, 2)
+	a.d.EstadoProcessando = func(ativo bool) { estados <- ativo }
+
+	a.comecar()
+	a.mu.Lock()
+	g := a.rec
+	a.mu.Unlock()
+	<-g.pronta
+	a.parar(false)
+	assertSemEstado(t, estados)
+}
+
 func receberEstado(t *testing.T, estados <-chan bool) bool {
 	t.Helper()
 	select {

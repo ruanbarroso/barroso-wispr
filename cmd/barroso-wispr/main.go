@@ -116,17 +116,18 @@ func run() int {
 	}
 
 	deps := app.Deps{
-		Gateway:    gw,
-		Chat:       gw,
-		Abrir:      app.AbrirLive,
-		Microfone:  mic,
-		Digitar:    digitar,
-		Dicionario: func() []string { return config.Dicionario(pref.Dicionario) },
-		ModeloVoz:  dest.Modelo,
-		ModeloQuik: dest.QuickModel,
-		BeepReady:  plataforma.BeepReady,
-		BeepDone:   plataforma.BeepDone,
-		Log:        log,
+		Gateway:           gw,
+		Chat:              gw,
+		Abrir:             app.AbrirLive,
+		Microfone:         mic,
+		Digitar:           digitar,
+		Dicionario:        func() []string { return config.Dicionario(pref.Dicionario) },
+		ModeloVoz:         dest.Modelo,
+		ModeloQuik:        dest.QuickModel,
+		BeepReady:         plataforma.BeepReady,
+		BeepDone:          plataforma.BeepDone,
+		EstadoProcessando: plataforma.EstadoProcessando,
+		Log:               log,
 	}
 	if indicador != nil {
 		deps.EstadoGravacao = indicador.SetActive

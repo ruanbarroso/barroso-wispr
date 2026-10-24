@@ -31,18 +31,19 @@ type Sessao interface {
 
 // Deps são as dependências injetáveis (o teste troca todas).
 type Deps struct {
-	Gateway        *gateway.Cliente
-	Chat           limpeza.Chat
-	Abrir          func(ctx context.Context, token, modeloReal, instrucao string) (Sessao, error)
-	Microfone      Microfone
-	Digitar        func(string) error
-	Dicionario     func() []string
-	ModeloVoz      string
-	ModeloQuik     string
-	Log            io.Writer
-	BeepReady      func()
-	BeepDone       func()
-	EstadoGravacao func(bool)
+	Gateway           *gateway.Cliente
+	Chat              limpeza.Chat
+	Abrir             func(ctx context.Context, token, modeloReal, instrucao string) (Sessao, error)
+	Microfone         Microfone
+	Digitar           func(string) error
+	Dicionario        func() []string
+	ModeloVoz         string
+	ModeloQuik        string
+	Log               io.Writer
+	BeepReady         func()
+	BeepDone          func()
+	EstadoGravacao    func(bool)
+	EstadoProcessando func(bool)
 }
 
 // App mantém a máquina do atalho e a gravação em curso.
@@ -357,6 +358,10 @@ func (a *App) parar(entregar bool) {
 	defer a.Aquecer()
 	a.d.Microfone.Parar()
 	a.notificarEstadoGravacao(g, false)
+	if entregar && a.d.EstadoProcessando != nil {
+		a.d.EstadoProcessando(true)
+		defer a.d.EstadoProcessando(false)
+	}
 	if a.d.BeepDone != nil {
 		a.d.BeepDone()
 	}
