@@ -3,6 +3,8 @@
 package plataforma
 
 import (
+	"encoding/binary"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,31 @@ import (
 )
 
 // SendInput recusa (retorna 0) se cbSize não for o sizeof(INPUT) do Win32.
+func TestRenderToneHasLowVolumeAndSoftFades(t *testing.T) {
+	const rate = 22050
+	note := tone{frequency: 523, duration: 120 * time.Millisecond, level: 0.035}
+	pcm := renderTone(note, rate)
+	if want := rate * 120 / 1000 * 2; len(pcm) != want {
+		t.Fatalf("PCM length = %d bytes, want %d", len(pcm), want)
+	}
+	peak := 0
+	for i := 0; i < len(pcm); i += 2 {
+		v := int(math.Abs(float64(int16(binary.LittleEndian.Uint16(pcm[i:])))))
+		if v > peak {
+			peak = v
+		}
+	}
+	if peak > math.MaxInt16*4/100 {
+		t.Fatalf("peak = %d, want a low-level soft tone", peak)
+	}
+	if got := int16(binary.LittleEndian.Uint16(pcm[:2])); got != 0 {
+		t.Fatalf("first sample = %d, want a zero-crossing fade-in", got)
+	}
+	if got := int16(binary.LittleEndian.Uint16(pcm[len(pcm)-2:])); got != 0 {
+		t.Fatalf("last sample = %d, want a zero-crossing fade-out", got)
+	}
+}
+
 func TestTamanhoDoINPUT(t *testing.T) {
 	want := uintptr(40)
 	if unsafe.Sizeof(uintptr(0)) == 4 {
