@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +58,8 @@ type App struct {
 	rec *gravacao
 
 	ativos   int // inclui finalização, limpeza e colagem após rec ser limpo
+	lote     *lote
+	proc     int // ditados processando; o pulso toca enquanto > 0
 	trocaPed bool
 	trocando bool
 	troca    func() bool
@@ -68,6 +71,14 @@ type App struct {
 	tokPrev  *gateway.Token
 	tokEm    time.Time
 	tokBusca chan struct{} // fecha quando o pedido em andamento termina
+}
+
+// lote junta os ditados que se sobrepõem: um ditado começado enquanto o
+// anterior ainda não foi colado entra no mesmo lote, e o lote só é colado,
+// de uma vez e na ordem de fala, quando todos os ditados dele terminaram.
+type lote struct {
+	partes []string
+	feitos int
 }
 
 // validadeToken fica abaixo dos 60 s que o token tem para abrir uma sessão
@@ -132,6 +143,8 @@ type gravacao struct {
 	token    gateway.Token
 	err      error
 	caiu     bool
+	lote     *lote
+	parte    int // posição deste ditado no lote
 	mu       sync.Mutex
 	pendente [][]byte // áudio capturado antes de a sessão abrir
 	// captureMu/capturando controlam o callback de estado da captura, isolado
@@ -282,6 +295,11 @@ func (a *App) comecar() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	g := &gravacao{ctx: ctx, cancel: cancel, inicio: time.Now(), pronta: make(chan struct{})}
+	if a.lote == nil {
+		a.lote = &lote{}
+	}
+	g.lote, g.parte = a.lote, len(a.lote.partes)
+	a.lote.partes = append(a.lote.partes, "")
 	a.rec = g
 	a.ativos++
 	a.mu.Unlock()
@@ -410,10 +428,14 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 	defer a.Aquecer()
 	a.d.Microfone.Parar()
 	a.notificarEstadoGravacao(g, false)
-	if entregar && a.d.EstadoProcessando != nil {
-		a.d.EstadoProcessando(true)
-		defer a.d.EstadoProcessando(false)
+	if entregar {
+		a.processando(1)
+		defer a.processando(-1)
 	}
+	// Roda antes dos defers acima: o texto (ou nada, se falhou ou foi
+	// cancelado) sempre libera a vaga deste ditado no lote.
+	texto := ""
+	defer func() { a.entregar(g, texto) }()
 	beepFim := a.d.BeepDone
 	g.mu.Lock()
 	caiu := g.caiu
@@ -459,8 +481,60 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 		a.logf("limpeza falhou, digitando o cru: %v", err)
 	}
 	a.logf("cru em %v, final em %v: %q", tCru.Round(time.Millisecond), time.Since(solto).Round(time.Millisecond), final)
-	if err := a.d.Digitar(final); err != nil {
+	texto = final
+}
+
+// entregar guarda o texto do ditado no lote e, se ele era o último pendente,
+// cola o lote inteiro de uma vez. Enquanto houver ditado gravando ou
+// processando no lote, nada é colado.
+func (a *App) entregar(g *gravacao, texto string) {
+	a.mu.Lock()
+	l := g.lote
+	l.partes[g.parte] = strings.TrimSpace(texto)
+	l.feitos++
+	if l.feitos < len(l.partes) {
+		a.mu.Unlock()
+		if texto != "" {
+			a.logf("texto guardado; esperando %d ditado(s) do lote", len(l.partes)-l.feitos)
+		}
+		return
+	}
+	if a.lote == l {
+		a.lote = nil
+	}
+	a.mu.Unlock()
+	var partes []string
+	for _, p := range l.partes {
+		if p != "" {
+			partes = append(partes, p)
+		}
+	}
+	if len(partes) == 0 {
+		return
+	}
+	if len(partes) > 1 {
+		a.logf("colando %d ditados juntos", len(partes))
+	}
+	if err := a.d.Digitar(strings.Join(partes, " ")); err != nil {
 		a.logf("digitar: %v", err)
+	}
+}
+
+// processando conta os ditados em transcrição/limpeza: o pulso liga no
+// primeiro e só desliga quando o último termina.
+func (a *App) processando(delta int) {
+	a.mu.Lock()
+	antes := a.proc
+	a.proc += delta
+	depois := a.proc
+	a.mu.Unlock()
+	if a.d.EstadoProcessando == nil {
+		return
+	}
+	if antes == 0 && depois > 0 {
+		a.d.EstadoProcessando(true)
+	} else if antes > 0 && depois == 0 {
+		a.d.EstadoProcessando(false)
 	}
 }
 

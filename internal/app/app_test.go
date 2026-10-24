@@ -38,6 +38,7 @@ func (m *micFake) Parar() {
 		m.active = false
 		if m.stopped != nil {
 			close(m.stopped)
+			m.stopped = nil // o mesmo microfone serve a vários ditados
 		}
 	}
 	m.mu.Unlock()
@@ -130,8 +131,11 @@ func TestQuedaDaConexaoEncerraAvisaEColaOParcial(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("o parcial não foi colado")
 	}
-	if !a.Ocioso() {
-		t.Fatal("app não voltou ao ocioso")
+	// A colagem acontece antes de o ditado sair da contagem de ativos.
+	for limite := time.Now().Add(time.Second); !a.Ocioso(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(limite) {
+			t.Fatal("app não voltou ao ocioso")
+		}
 	}
 	// O próximo Ctrl+Alt começa um ditado novo.
 	a.mu.Lock()
@@ -150,6 +154,144 @@ func TestEsperaFinalCresceComAGravacao(t *testing.T) {
 	}
 	if q2 > 4*time.Second || t2 > 30*time.Second {
 		t.Fatalf("longa passou do teto: (%v,%v)", q2, t2)
+	}
+}
+
+// sessaoTexto devolve um texto fixo quando liberada.
+type sessaoTexto struct {
+	texto  string
+	libera chan struct{}
+}
+
+func (s *sessaoTexto) EnviarAudio(context.Context, []byte) error { return nil }
+func (s *sessaoTexto) Finalizar(context.Context, time.Duration, time.Duration) (string, error) {
+	<-s.libera
+	return s.texto, nil
+}
+func (s *sessaoTexto) Uso() (int, int)      { return 0, 0 }
+func (s *sessaoTexto) Fechar()              {}
+func (s *sessaoTexto) Caiu() (bool, string) { return false, "" }
+
+// Ditados que se sobrepõem (o próximo começa antes de o anterior ser colado)
+// são colados uma única vez, juntos e na ordem de fala, mesmo que o último a
+// terminar o processamento seja o primeiro a ter sido falado.
+func TestDitadosSobrepostosSaoColadosJuntosNaOrdem(t *testing.T) {
+	sessoes := []*sessaoTexto{
+		{texto: "Primeiro.", libera: make(chan struct{})},
+		{texto: "Segundo.", libera: make(chan struct{})},
+		{texto: "Terceiro.", libera: make(chan struct{})},
+	}
+	var mu sync.Mutex
+	n := 0
+	colado := make(chan string, 4)
+	a := newAppTest(t, nil, func(s string) error { colado <- s; return nil })
+	a.d.Chat = chatEco{}
+	a.d.Abrir = func(context.Context, string, string, string) (Sessao, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		s := sessoes[n]
+		n++
+		return s, nil
+	}
+	gravarESoltar := func() {
+		a.comecar()
+		a.mu.Lock()
+		g := a.rec
+		a.mu.Unlock()
+		<-g.pronta
+		go a.parar(true)
+		for {
+			a.mu.Lock()
+			livre := a.rec == nil
+			a.mu.Unlock()
+			if livre {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	gravarESoltar()
+	gravarESoltar()
+	gravarESoltar()
+	close(sessoes[2].libera)
+	close(sessoes[1].libera)
+	select {
+	case got := <-colado:
+		t.Fatalf("colou %q antes de o primeiro terminar", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(sessoes[0].libera)
+	select {
+	case got := <-colado:
+		if got != "Primeiro. Segundo. Terceiro." {
+			t.Fatalf("colado = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("o lote não foi colado")
+	}
+	select {
+	case got := <-colado:
+		t.Fatalf("colagem extra: %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Depois do lote colado, um ditado novo é colado sozinho.
+	sessoes = append(sessoes, &sessaoTexto{texto: "Quarto.", libera: make(chan struct{})})
+	close(sessoes[3].libera)
+	gravarESoltar()
+	select {
+	case got := <-colado:
+		if got != "Quarto." {
+			t.Fatalf("colado = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ditado novo não foi colado")
+	}
+}
+
+// Enquanto há uma gravação em curso, o ditado anterior já processado espera.
+func TestNaoColaEnquantoOutroDitadoGrava(t *testing.T) {
+	primeira := &sessaoTexto{texto: "Antes.", libera: make(chan struct{})}
+	segunda := &sessaoTexto{texto: "Depois.", libera: make(chan struct{})}
+	close(primeira.libera)
+	close(segunda.libera)
+	abertas := 0
+	colado := make(chan string, 2)
+	a := newAppTest(t, nil, func(s string) error { colado <- s; return nil })
+	a.d.Chat = chatEco{}
+	a.d.Abrir = func(context.Context, string, string, string) (Sessao, error) {
+		abertas++
+		if abertas == 1 {
+			return primeira, nil
+		}
+		return segunda, nil
+	}
+	a.comecar()
+	a.mu.Lock()
+	g1 := a.rec
+	a.mu.Unlock()
+	<-g1.pronta
+	a.mu.Lock()
+	a.rec = nil
+	a.mu.Unlock()
+	a.comecar() // segunda começa antes de a primeira terminar de processar
+	a.mu.Lock()
+	g2 := a.rec
+	a.mu.Unlock()
+	<-g2.pronta
+	go a.encerrar(g1, true)
+	select {
+	case got := <-colado:
+		t.Fatalf("colou %q com a segunda ainda gravando", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+	go a.parar(true)
+	select {
+	case got := <-colado:
+		if got != "Antes. Depois." {
+			t.Fatalf("colado = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("nada colado")
 	}
 }
 
