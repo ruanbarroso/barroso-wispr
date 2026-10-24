@@ -52,8 +52,28 @@ func (s *sessaoFake) Finalizar(context.Context, time.Duration, time.Duration) (s
 	close(s.finalizou)
 	return "ola, KIS", nil
 }
-func (s *sessaoFake) Uso() (int, int) { return 1, 1 }
-func (s *sessaoFake) Fechar()         {}
+func (s *sessaoFake) Uso() (int, int)      { return 1, 1 }
+func (s *sessaoFake) Fechar()              {}
+func (s *sessaoFake) Caiu() (bool, string) { return false, "" }
+
+// sessaoQueCai transcreve um começo e depois perde a conexão sozinha.
+type sessaoQueCai struct {
+	mu   sync.Mutex
+	caiu bool
+}
+
+func (s *sessaoQueCai) EnviarAudio(context.Context, []byte) error { return nil }
+func (s *sessaoQueCai) Finalizar(context.Context, time.Duration, time.Duration) (string, error) {
+	return "só o começo", errors.New("conexão encerrada")
+}
+func (s *sessaoQueCai) Uso() (int, int) { return 0, 0 }
+func (s *sessaoQueCai) Fechar()         {}
+func (s *sessaoQueCai) derrubar()       { s.mu.Lock(); s.caiu = true; s.mu.Unlock() }
+func (s *sessaoQueCai) Caiu() (bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.caiu, "status = StatusGoingAway"
+}
 
 type bloqueiaFinal struct {
 	iniciou chan struct{}
@@ -66,8 +86,65 @@ func (s *bloqueiaFinal) Finalizar(context.Context, time.Duration, time.Duration)
 	<-s.libera
 	return "texto final", nil
 }
-func (s *bloqueiaFinal) Uso() (int, int) { return 0, 0 }
-func (s *bloqueiaFinal) Fechar()         {}
+func (s *bloqueiaFinal) Uso() (int, int)      { return 0, 0 }
+func (s *bloqueiaFinal) Fechar()              {}
+func (s *bloqueiaFinal) Caiu() (bool, string) { return false, "" }
+
+// Queda da Live no meio do ditado: sem o usuário soltar o atalho, a captura
+// para, toca o som de erro (não o de fim), a borda apaga e o que já foi
+// transcrito é colado.
+func TestQuedaDaConexaoEncerraAvisaEColaOParcial(t *testing.T) {
+	sess := &sessaoQueCai{}
+	colado := make(chan string, 1)
+	a := newAppTest(t, sess, func(s string) error { colado <- s; return nil })
+	a.d.Chat = chatEco{}
+	sons := make(chan string, 4)
+	a.d.BeepReady = func() { sons <- "ready" }
+	a.d.BeepDone = func() { sons <- "done" }
+	a.d.BeepErro = func() { sons <- "erro" }
+	estados := make(chan bool, 4)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+
+	a.comecar()
+	if got := receberEstado(t, estados); !got {
+		t.Fatal("borda não acendeu")
+	}
+	<-sons // ready
+	sess.derrubar()
+	if got := receberEstado(t, estados); got {
+		t.Fatal("borda não apagou após a queda")
+	}
+	select {
+	case got := <-sons:
+		if got != "erro" {
+			t.Fatalf("som = %q, want erro", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sem som de erro após a queda")
+	}
+	select {
+	case got := <-colado:
+		if got != "só o começo" {
+			t.Fatalf("colado = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("o parcial não foi colado")
+	}
+	if !a.Ocioso() {
+		t.Fatal("app não voltou ao ocioso")
+	}
+	// O próximo Ctrl+Alt começa um ditado novo.
+	a.mu.Lock()
+	gravando := a.maq.Gravando()
+	a.mu.Unlock()
+	if gravando {
+		t.Fatal("máquina do atalho ficou presa em gravando")
+	}
+}
+
+type chatEco struct{}
+
+func (chatEco) Chat(_ context.Context, _, _, cru string) (string, error) { return cru, nil }
 
 type micFalho struct {
 	iniciar chan struct{}

@@ -27,6 +27,8 @@ type Sessao interface {
 	Finalizar(ctx context.Context, quieto, teto time.Duration) (string, error)
 	Uso() (entrada, saida int)
 	Fechar()
+	// Caiu diz se a conexão terminou sem o app pedir, e por quê.
+	Caiu() (bool, string)
 }
 
 // Deps são as dependências injetáveis (o teste troca todas).
@@ -42,6 +44,7 @@ type Deps struct {
 	Log               io.Writer
 	BeepReady         func()
 	BeepDone          func()
+	BeepErro          func() // no lugar do BeepDone quando a gravação parou sozinha
 	EstadoGravacao    func(bool)
 	EstadoProcessando func(bool)
 }
@@ -128,6 +131,7 @@ type gravacao struct {
 	sessao   Sessao
 	token    gateway.Token
 	err      error
+	caiu     bool
 	mu       sync.Mutex
 	pendente [][]byte // áudio capturado antes de a sessão abrir
 	// captureMu/capturando controlam o callback de estado da captura, isolado
@@ -342,6 +346,49 @@ func (a *App) comecar() {
 			_ = s.EnviarAudio(ctx, b)
 		}
 	}()
+	go a.vigiarConexao(g)
+}
+
+// vigiarConexao encerra o ditado no instante em que a sessão Live falha ou
+// cai no meio da gravação. Antes o usuário continuava falando sem nada ser
+// transcrito e só descobria no fim, com o texto cortado: agora toca o som de
+// erro, a borda some e o que já foi transcrito é colado no cursor.
+func (a *App) vigiarConexao(g *gravacao) {
+	select {
+	case <-g.pronta:
+	case <-g.ctx.Done():
+		return
+	}
+	motivo := ""
+	if g.err != nil {
+		motivo = g.err.Error()
+	} else {
+		tick := time.NewTicker(200 * time.Millisecond)
+		defer tick.Stop()
+		for motivo == "" {
+			select {
+			case <-g.ctx.Done():
+				return
+			case <-tick.C:
+				if caiu, m := g.sessao.Caiu(); caiu {
+					motivo = m
+				}
+			}
+		}
+	}
+	a.mu.Lock()
+	if a.rec != g {
+		a.mu.Unlock()
+		return // o usuário já tinha encerrado
+	}
+	a.rec = nil
+	a.maq.Reset() // um próximo Ctrl+Alt começa ditado novo, não "encerra" este
+	a.mu.Unlock()
+	g.mu.Lock()
+	g.caiu = true
+	g.mu.Unlock()
+	a.logf("a gravação parou sozinha: %s", motivo)
+	a.encerrar(g, true)
 }
 
 func (a *App) parar(entregar bool) {
@@ -352,6 +399,11 @@ func (a *App) parar(entregar bool) {
 	if g == nil {
 		return
 	}
+	a.encerrar(g, entregar)
+}
+
+// encerrar desliga a captura de g e, se entregar, transcreve e cola.
+func (a *App) encerrar(g *gravacao, entregar bool) {
 	defer g.cancel()
 	defer a.terminouDitado() // roda por último: depois da colagem e do Fechar
 	// Depois de um ditado costuma vir outro: deixa o próximo token pronto.
@@ -362,8 +414,15 @@ func (a *App) parar(entregar bool) {
 		a.d.EstadoProcessando(true)
 		defer a.d.EstadoProcessando(false)
 	}
-	if a.d.BeepDone != nil {
-		a.d.BeepDone()
+	beepFim := a.d.BeepDone
+	g.mu.Lock()
+	caiu := g.caiu
+	g.mu.Unlock()
+	if caiu && a.d.BeepErro != nil {
+		beepFim = a.d.BeepErro
+	}
+	if beepFim != nil {
+		beepFim()
 	}
 	if !entregar {
 		a.logf("gravação cancelada")

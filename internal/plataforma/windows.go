@@ -98,6 +98,12 @@ func BeepDone() {
 	playTones([]tone{{frequency: 587, duration: 95 * time.Millisecond, level: 0.046}, {frequency: 494, duration: 120 * time.Millisecond, level: 0.046}})
 }
 
+// BeepErro é o aviso de que a gravação parou sozinha (a conexão Live caiu):
+// três notas descendo, mais graves que o tom de fim normal.
+func BeepErro() {
+	playTones([]tone{{frequency: 440, duration: 110 * time.Millisecond, level: 0.05}, {frequency: 349, duration: 130 * time.Millisecond, level: 0.05}, {frequency: 262, duration: 170 * time.Millisecond, level: 0.05}})
+}
+
 // EstadoProcessando liga ou desliga um pulso discreto durante a transcrição,
 // a limpeza e a colagem.
 func EstadoProcessando(ativo bool) { processando.definir(ativo) }

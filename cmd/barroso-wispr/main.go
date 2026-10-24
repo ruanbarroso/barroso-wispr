@@ -126,6 +126,7 @@ func run() int {
 		ModeloQuik:        dest.QuickModel,
 		BeepReady:         plataforma.BeepReady,
 		BeepDone:          plataforma.BeepDone,
+		BeepErro:          plataforma.BeepErro,
 		EstadoProcessando: plataforma.EstadoProcessando,
 		Log:               log,
 	}

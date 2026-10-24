@@ -74,14 +74,20 @@ type quadro struct {
 type Sessao struct {
 	conn *websocket.Conn
 
-	mu        sync.Mutex
-	texto     strings.Builder
-	ultima    time.Time // hora da última parcial recebida
-	entrada   int
-	saida     int
-	erroLeit  error
-	terminou  chan struct{}
-	onParcial func(string)
+	mu       sync.Mutex
+	texto    strings.Builder
+	ultima   time.Time // hora da última parcial recebida
+	entrada  int
+	saida    int
+	erroLeit error
+	terminou chan struct{}
+	// encerrando marca que o fim da conexão foi pedido pelo app (Finalizar ou
+	// Fechar). Qualquer fim sem isso — inclusive um fechamento "normal" vindo
+	// do servidor — é queda no meio da gravação.
+	encerrando bool
+	caiu       bool
+	motivo     string
+	onParcial  func(string)
 }
 
 // Abrir conecta, manda o setup e espera o setupComplete.
@@ -129,6 +135,10 @@ func (s *Sessao) ler() {
 			if websocket.CloseStatus(err) != websocket.StatusNormalClosure {
 				s.erroLeit = err
 			}
+			if !s.encerrando {
+				s.caiu = true
+				s.motivo = err.Error()
+			}
 			s.mu.Unlock()
 			return
 		}
@@ -170,6 +180,9 @@ func (s *Sessao) EnviarAudio(ctx context.Context, pcm []byte) error {
 // quando passa `quieto` sem parcial nova depois do fim, ou no `teto`.
 func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (string, error) {
 	b, _ := json.Marshal(map[string]any{"realtimeInput": map[string]any{"audioStreamEnd": true}})
+	s.mu.Lock()
+	s.encerrando = true
+	s.mu.Unlock()
 	fim := time.Now()
 	if err := s.conn.Write(ctx, websocket.MessageText, b); err != nil {
 		return s.Texto(), err
@@ -226,5 +239,16 @@ func (s *Sessao) Uso() (entrada, saida int) {
 
 // Fechar encerra a conexão.
 func (s *Sessao) Fechar() {
+	s.mu.Lock()
+	s.encerrando = true
+	s.mu.Unlock()
 	_ = s.conn.Close(websocket.StatusNormalClosure, "")
+}
+
+// Caiu informa se a conexão terminou sem o app pedir — rede, cota, limite de
+// sessão ou fechamento do servidor — e o motivo, para o log.
+func (s *Sessao) Caiu() (bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.caiu, s.motivo
 }
