@@ -116,14 +116,14 @@ func run() int {
 	}
 
 	deps := app.Deps{
-		Gateway:           gw,
-		Chat:              gw,
-		Abrir:             app.AbrirLive,
-		Microfone:         mic,
-		Digitar:           digitar,
-		Dicionario:        func() []string { return config.Dicionario(pref.Dicionario) },
-		ModeloVoz:         dest.Modelo,
-		ModeloQuik:        dest.QuickModel,
+		Gateway:    gw,
+		Chat:       gw,
+		Abrir:      app.AbrirLive,
+		Microfone:  mic,
+		Digitar:    digitar,
+		Dicionario: func() []string { return config.Dicionario(pref.Dicionario) },
+		ModeloVoz:  dest.Modelo,
+		ModeloQuik: dest.QuickModel,
 		Transcrever: func(ctx context.Context, pcm []byte) (string, error) {
 			return gw.Transcrever(ctx, dest.STTModel, gateway.WAV(pcm, plataforma.TaxaAmostras))
 		},
