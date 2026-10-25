@@ -449,6 +449,19 @@ func stopRunning(installDir string) error {
 	return errors.Join(errs...)
 }
 
+// EncerrarOutrasCopias fecha as outras cópias do app que rodam da mesma pasta
+// deste executável: a que subiu por último vale. Sem isso, um Stop/Start da
+// tarefa de logon deixava a cópia lançada pelo auxiliar de atualização viva
+// (2026-10-25: bw.13 e bw.15 rodando juntas, o atalho disparando nas duas).
+// Melhor esforço: uma cópia sem elevação não consegue fechar uma elevada.
+func EncerrarOutrasCopias() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return stopRunning(filepath.Dir(exe))
+}
+
 func launch(exe string, args []string, dir string) error {
 	cmd := exec.Command(exe, args...)
 	cmd.Dir = dir

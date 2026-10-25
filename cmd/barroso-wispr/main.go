@@ -75,6 +75,13 @@ func run() int {
 		mostrarMensagem("Barroso Wispr", "Não foi possível abrir wispr.log.\n\n"+logErr.Error())
 	}
 
+	if *arquivo == "" {
+		// Uma única cópia escuta o atalho: a mais nova fecha as anteriores.
+		if err := instalacao.EncerrarOutrasCopias(); err != nil {
+			fmt.Fprintf(log, "barroso-wispr: não foi possível fechar outra cópia em execução: %v\n", err)
+		}
+	}
+
 	pref := config.Carregar()
 	dest, err := config.Resolver(pref)
 	if err != nil {
