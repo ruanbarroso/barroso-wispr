@@ -724,3 +724,102 @@ func assertSemEstado(t *testing.T, estados <-chan bool) {
 	case <-time.After(30 * time.Millisecond):
 	}
 }
+
+// A borda e o som de entrada só aparecem depois que a sessão Live abriu.
+func TestBordaSoAcendeDepoisDaSessaoAberta(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	libera := make(chan struct{})
+	a.d.Abrir = func(context.Context, string, string, string) (Sessao, error) {
+		<-libera
+		return sess, nil
+	}
+	estados := make(chan bool, 2)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+	sons := make(chan string, 2)
+	a.d.BeepReady = func() { sons <- "ready" }
+
+	a.comecar()
+	assertSemEstado(t, estados)
+	select {
+	case <-sons:
+		t.Fatal("som de entrada antes de a sessão abrir")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(libera)
+	if got := receberEstado(t, estados); !got {
+		t.Fatal("borda não acendeu com a sessão aberta")
+	}
+	select {
+	case <-sons:
+	case <-time.After(time.Second):
+		t.Fatal("som de entrada não tocou")
+	}
+}
+
+// Soltar antes de a sessão abrir não acende a borda depois.
+func TestSoltarAntesDaSessaoNaoAcendeBorda(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	libera := make(chan struct{})
+	a.d.Abrir = func(context.Context, string, string, string) (Sessao, error) {
+		<-libera
+		return sess, nil
+	}
+	estados := make(chan bool, 4)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+	a.comecar()
+	go a.parar(true)
+	if got := receberEstado(t, estados); got {
+		t.Fatal("estado = true, want false ao soltar")
+	}
+	close(libera)
+	assertSemEstado(t, estados)
+}
+
+type sessaoVazia struct{}
+
+func (sessaoVazia) EnviarAudio(context.Context, []byte) error { return nil }
+func (sessaoVazia) Finalizar(context.Context, time.Duration, time.Duration) (string, error) {
+	return "", nil
+}
+func (sessaoVazia) Uso() (int, int)      { return 0, 0 }
+func (sessaoVazia) Fechar()              {}
+func (sessaoVazia) Caiu() (bool, string) { return false, "" }
+
+type micComAudio struct{ micFake }
+
+func (m *micComAudio) Iniciar(f func([]byte)) error {
+	f(make([]byte, 32000)) // 1 s de áudio
+	return m.micFake.Iniciar(f)
+}
+
+// Live sem texto: o áudio inteiro vai para a transcrição de reserva e é colado.
+func TestLiveSemTextoUsaReserva(t *testing.T) {
+	colado := make(chan string, 1)
+	a := newAppTest(t, sessaoVazia{}, func(s string) error { colado <- s; return nil })
+	a.d.Chat = chatEco{}
+	a.d.Microfone = &micComAudio{}
+	recebido := 0
+	a.d.Transcrever = func(_ context.Context, pcm []byte) (string, error) {
+		recebido = len(pcm)
+		return "texto da reserva", nil
+	}
+	a.comecar()
+	a.mu.Lock()
+	g := a.rec
+	a.mu.Unlock()
+	<-g.pronta
+	go a.parar(true)
+	select {
+	case got := <-colado:
+		if got != "texto da reserva" {
+			t.Fatalf("colado = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reserva não colou")
+	}
+	if recebido != 32000 {
+		t.Fatalf("reserva recebeu %d bytes, want 32000", recebido)
+	}
+}

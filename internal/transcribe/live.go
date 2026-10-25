@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"sync"
@@ -93,6 +94,7 @@ type Sessao struct {
 	caiu       bool
 	motivo     string
 	onParcial  func(string)
+	quadros    int // quadros do servidor depois do setup (diagnóstico)
 }
 
 // Abrir conecta, manda o setup e espera o setupComplete.
@@ -152,6 +154,7 @@ func (s *Sessao) ler() {
 			continue
 		}
 		s.mu.Lock()
+		s.quadros++
 		if q.ServerContent != nil && q.ServerContent.InputTranscription != nil && q.ServerContent.InputTranscription.Text != "" {
 			s.texto.WriteString(q.ServerContent.InputTranscription.Text)
 			s.ultima = time.Now()
@@ -187,6 +190,9 @@ func (s *Sessao) EnviarAudio(ctx context.Context, pcm []byte) error {
 // folgaTurno é quanto esperar, depois do sinal de fim que chega após o fim do
 // áudio, por alguma parcial atrasada antes de devolver o texto.
 const folgaTurno = 300 * time.Millisecond
+
+// folgaVazio é a espera depois de um fim de geração sem nenhuma parcial.
+const folgaVazio = 1 * time.Second
 
 // Finalizar avisa o fim do áudio e espera a transcrição assentar. O caminho
 // normal é o sinal do servidor: generationComplete (ou turnComplete) depois
@@ -227,6 +233,12 @@ func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (str
 				ref = ultima
 			}
 			if !temTexto {
+				// O modelo declarou o fim sem transcrever nada: espera um pouco
+				// por uma parcial atrasada e desiste, em vez de ir até o teto —
+				// quem chama ainda tem a transcrição de reserva para tentar.
+				if turno.After(fim) && time.Since(turno) >= folgaVazio {
+					return "", nil
+				}
 				continue
 			}
 			if turno.After(fim) && time.Since(ref) >= folgaTurno && time.Since(turno) >= folgaTurno {
@@ -265,6 +277,17 @@ func (s *Sessao) Fechar() {
 	s.encerrando = true
 	s.mu.Unlock()
 	_ = s.conn.Close(websocket.StatusNormalClosure, "")
+}
+
+// Diagnostico resume o que o servidor mandou, para o log de "nada transcrito".
+func (s *Sessao) Diagnostico() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fimGer := "não"
+	if !s.turno.IsZero() {
+		fimGer = "sim"
+	}
+	return fmt.Sprintf("%d quadro(s) do servidor, generationComplete: %s", s.quadros, fimGer)
 }
 
 // Caiu informa se a conexão terminou sem o app pedir — rede, cota, limite de

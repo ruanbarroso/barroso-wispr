@@ -46,6 +46,9 @@ const (
 	ModeloQuickBarroso = "barroso-quick"
 	ModeloVozGoogle    = "gemini-3.5-transcribe-live"
 	ModeloQuickGoogle  = "gemini-3.5-flash-lite"
+	// Transcrição de reserva (áudio inteiro) quando a Live não devolve nada.
+	ModeloSTTBarroso = "barroso-stt"
+	ModeloSTTGoogle  = "gemini-3.5-flash-lite"
 
 	ProviderBarroso = "barroso"
 	ProviderGoogle  = "google"
@@ -107,6 +110,7 @@ type Destino struct {
 	APIKey     string
 	Modelo     string
 	QuickModel string
+	STTModel   string
 }
 
 // Resolver usa só o prefixo da chave: `bk-` é Barroso Keys; qualquer outro
@@ -119,12 +123,12 @@ func Resolver(_ Preferencias) (Destino, error) {
 	if strings.HasPrefix(c.APIKey, BarrosoKeyPrefix) {
 		return Destino{
 			Provider: ProviderBarroso, BaseURL: DefaultBaseURL, APIKey: c.APIKey,
-			Modelo: ModeloVozBarroso, QuickModel: ModeloQuickBarroso,
+			Modelo: ModeloVozBarroso, QuickModel: ModeloQuickBarroso, STTModel: ModeloSTTBarroso,
 		}, nil
 	}
 	return Destino{
 		Provider: ProviderGoogle, APIKey: c.APIKey,
-		Modelo: ModeloVozGoogle, QuickModel: ModeloQuickGoogle,
+		Modelo: ModeloVozGoogle, QuickModel: ModeloQuickGoogle, STTModel: ModeloSTTGoogle,
 	}, nil
 }
 

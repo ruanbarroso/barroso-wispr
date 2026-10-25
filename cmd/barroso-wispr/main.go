@@ -124,6 +124,9 @@ func run() int {
 		Dicionario:        func() []string { return config.Dicionario(pref.Dicionario) },
 		ModeloVoz:         dest.Modelo,
 		ModeloQuik:        dest.QuickModel,
+		Transcrever: func(ctx context.Context, pcm []byte) (string, error) {
+			return gw.Transcrever(ctx, dest.STTModel, gateway.WAV(pcm, plataforma.TaxaAmostras))
+		},
 		BeepReady:         plataforma.BeepReady,
 		BeepDone:          plataforma.BeepDone,
 		BeepErro:          plataforma.BeepErro,

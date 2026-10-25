@@ -48,7 +48,13 @@ type Deps struct {
 	BeepErro          func() // no lugar do BeepDone quando a gravação parou sozinha
 	EstadoGravacao    func(bool)
 	EstadoProcessando func(bool)
+	// Transcrever é a reserva: transcreve o áudio inteiro do ditado de uma vez
+	// quando a Live não devolve texto. Opcional.
+	Transcrever func(ctx context.Context, pcm []byte) (string, error)
 }
+
+// diagnosticavel é a sessão que sabe resumir o que o servidor mandou.
+type diagnosticavel interface{ Diagnostico() string }
 
 // App mantém a máquina do atalho e a gravação em curso.
 type App struct {
@@ -147,6 +153,8 @@ type gravacao struct {
 	parte    int // posição deste ditado no lote
 	mu       sync.Mutex
 	pendente [][]byte // áudio capturado antes de a sessão abrir
+	audio    []byte   // todo o áudio do ditado, para a transcrição de reserva
+	bytesAud int
 	// captureMu/capturando controlam o callback de estado da captura, isolado
 	// do beep: o microfone já desligou, mas a finalização/colagem ainda segue.
 	captureMu              sync.Mutex
@@ -350,14 +358,19 @@ func (a *App) comecar() {
 	a.iniciar(g)
 }
 
-// iniciar liga o microfone NA HORA e abre a sessão em paralelo: o áudio do
-// primeiro meio segundo fica em buffer e é enviado quando o setup completa,
-// para não perder a primeira palavra.
+// iniciar liga o microfone NA HORA e abre a sessão em paralelo: o áudio de
+// antes do setup fica em buffer e é enviado quando ele completa. A borda azul
+// e o som de entrada só aparecem quando a sessão abriu: o usuário fala
+// depois de ver a borda, e a partir dali o áudio vai direto para a Live.
 func (a *App) iniciar(g *gravacao) {
 	ctx := g.ctx
 	err := a.d.Microfone.Iniciar(func(pcm []byte) {
 		b := append([]byte(nil), pcm...)
 		g.mu.Lock()
+		if a.d.Transcrever != nil {
+			g.audio = append(g.audio, b...)
+		}
+		g.bytesAud += len(b)
 		if g.sessao == nil {
 			g.pendente = append(g.pendente, b)
 			g.mu.Unlock()
@@ -367,18 +380,10 @@ func (a *App) iniciar(g *gravacao) {
 		g.mu.Unlock()
 		_ = s.EnviarAudio(g.ctx, b)
 	})
+	micOK := err == nil
 	if err != nil {
 		a.logf("microfone: %v", err)
 		a.notificarEstadoGravacao(g, false)
-	} else {
-		if !a.notificarEstadoGravacao(g, true) {
-			// A gravação pode ter sido encerrada enquanto Iniciar ainda rodava.
-			a.d.Microfone.Parar()
-		} else if a.d.BeepReady != nil {
-			// O microfone já grava desde aqui; o áudio fica em buffer até a sessão
-			// abrir. Então já dá para falar — não precisa esperar a conexão.
-			a.d.BeepReady()
-		}
 	}
 
 	go func() {
@@ -414,6 +419,14 @@ func (a *App) iniciar(g *gravacao) {
 		g.mu.Unlock()
 		for _, b := range pend {
 			_ = s.EnviarAudio(ctx, b)
+		}
+		// Só agora está pronto para ouvir: acende a borda e toca a entrada. Se
+		// o usuário já soltou, notificar devolve false e nada aparece.
+		if micOK && a.notificarEstadoGravacao(g, true) {
+			a.logf("pronto para falar")
+			if a.d.BeepReady != nil {
+				a.d.BeepReady()
+			}
 		}
 	}()
 	go a.vigiarConexao(g)
@@ -521,7 +534,9 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 	a.reportarUso(g)
 	if err != nil && cru == "" {
 		a.logf("transcrição: %v", err)
-		return
+	}
+	if cru == "" {
+		cru = a.reserva(g, s)
 	}
 	tCru := time.Since(solto)
 	if cru == "" {
@@ -534,6 +549,41 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 	}
 	a.logf("cru em %v, final em %v: %q", tCru.Round(time.Millisecond), time.Since(solto).Round(time.Millisecond), final)
 	texto = final
+}
+
+// minReserva é o mínimo de áudio (0,5 s a 16 kHz s16le) para valer a reserva.
+const minReserva = 16000 * 2 / 2
+
+// reserva transcreve o áudio inteiro do ditado quando a Live terminou sem
+// texto. Em 2026-10-25 19:49 a Live abriu, recebeu 3 s de fala e não devolveu
+// nada: com a borda acesa o usuário falou, e o texto tem de sair.
+func (a *App) reserva(g *gravacao, s Sessao) string {
+	diag := ""
+	if d, ok := s.(diagnosticavel); ok {
+		diag = " (" + d.Diagnostico() + ")"
+	}
+	g.mu.Lock()
+	pcm := g.audio
+	g.audio = nil
+	g.mu.Unlock()
+	if a.d.Transcrever == nil || len(pcm) < minReserva {
+		if diag != "" {
+			a.logf("Live sem texto%s", diag)
+		}
+		return ""
+	}
+	a.logf("Live sem texto%s; transcrevendo %v de áudio pela reserva", diag,
+		(time.Duration(len(pcm)) * time.Second / 32000).Round(100*time.Millisecond))
+	ctx, cancel := context.WithTimeout(g.ctx, 60*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	texto, err := a.d.Transcrever(ctx, pcm)
+	if err != nil {
+		a.logf("reserva falhou: %v", err)
+		return ""
+	}
+	a.logf("reserva em %v", time.Since(t0).Round(time.Millisecond))
+	return strings.TrimSpace(texto)
 }
 
 // entregar guarda o texto do ditado no lote e, se ele era o último pendente,
