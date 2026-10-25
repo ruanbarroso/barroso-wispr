@@ -13,6 +13,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strings"
 	"time"
 )
@@ -224,7 +225,12 @@ func (c *Cliente) Transcrever(ctx context.Context, model string, wav []byte) (st
 	mw := multipart.NewWriter(&corpo)
 	_ = mw.WriteField("model", model)
 	_ = mw.WriteField("response_format", "json")
-	fw, err := mw.CreateFormFile("file", "ditado.wav")
+	// CreateFormFile declara application/octet-stream, e o Gemini recusa esse
+	// mime com 400 em todos os degraus (2026-10-25 20:29, 34 falhas).
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", `form-data; name="file"; filename="ditado.wav"`)
+	h.Set("Content-Type", "audio/wav")
+	fw, err := mw.CreatePart(h)
 	if err != nil {
 		return "", err
 	}
