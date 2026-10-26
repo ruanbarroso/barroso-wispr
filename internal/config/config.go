@@ -1,5 +1,5 @@
 // Package config lê uma única chave WISPR_API_KEY e decide o backend pelo
-// prefixo `bk_`: Barroso Keys; demais chaves: Google AI Studio. Guarda também
+// prefixo `bk-`: Barroso Keys; demais chaves: Google AI Studio. Guarda também
 // preferências sem segredos em ~/.barroso-wispr/config.json.
 package config
 

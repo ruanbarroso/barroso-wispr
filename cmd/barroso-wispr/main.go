@@ -1,5 +1,3 @@
-//go:build windows
-
 // barroso-wispr: ditado por voz ao vivo. Segure Ctrl+Alt (esquerdos) e fale;
 // solte e o texto é digitado onde está o cursor. Dois toques rápidos travam a
 // gravação; um toque encerra.
@@ -14,9 +12,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"time"
-	"unsafe"
-
-	"golang.org/x/sys/windows"
 
 	"github.com/ruanbarroso/barroso-wispr/internal/app"
 	"github.com/ruanbarroso/barroso-wispr/internal/atualizacao"
@@ -42,10 +37,7 @@ func main() {
 }
 
 func run() int {
-	readyPath := os.Getenv("BARROSO_WISPR_UPDATE_READY")
-	if readyPath != "" {
-		_ = os.Unsetenv("BARROSO_WISPR_UPDATE_READY")
-	}
+	readyPath := atualizacao.CaminhoPronto()
 	versao := flag.Bool("version", false, "mostra a versão")
 	instalar := flag.Bool("install", false, "instala o app e o inicia")
 	arquivo := flag.String("arquivo", "", "dita um PCM s16le 16 kHz mono deste arquivo e imprime o texto (diagnóstico, sem microfone nem teclado)")
@@ -198,20 +190,6 @@ func run() int {
 	return 0
 }
 
-const (
-	mbOK            = 0x00000000
-	mbIconError     = 0x00000010
-	mbSetForeground = 0x00010000
-)
-
-var procMessageBoxW = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
-
-func mostrarMensagem(titulo, mensagem string) {
-	t, _ := windows.UTF16PtrFromString(titulo)
-	m, _ := windows.UTF16PtrFromString(mensagem)
-	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), mbOK|mbIconError|mbSetForeground)
-}
-
 func instalarLogSeExiste() io.Writer {
 	f, err := os.OpenFile(filepath.Join(config.Home(), "wispr.log"), os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -236,5 +214,7 @@ func mostrarErro(log io.Writer, mensagem string, err error) {
 	if log != nil {
 		fmt.Fprintf(log, "barroso-wispr: %s: %v\n", mensagem, err)
 	}
+	// No macOS o --install roda no Terminal: o erro precisa aparecer lá também.
+	fmt.Fprintf(os.Stderr, "barroso-wispr: %s: %v\n", mensagem, err)
 	mostrarMensagem("Barroso Wispr", mensagem+".\n\n"+err.Error())
 }

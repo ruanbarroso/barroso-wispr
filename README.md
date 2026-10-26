@@ -9,7 +9,7 @@ and a short cleanup pass fixes the spelling of your own terms (names, companies,
 jargon), removes filler words, punctuates, and keeps only the final version
 when you correct yourself mid-sentence.
 
-Status: early MVP, **Windows only** for now (macOS and Linux are planned).
+Status: early MVP for Windows and macOS.
 
 ## Usage
 
@@ -51,12 +51,46 @@ uses each release's SHA-256 and candidate `-version` checks before replacing the
 executable, keeping a numbered backup for rollback. User configuration is never
 part of an update.
 
+## macOS
+
+The release contains standalone binaries for Apple silicon (`arm64`) and Intel
+(`amd64`). Download the matching `barroso-wispr-darwin-*` file, then in Terminal
+run (replace the filename if using an Intel Mac):
+
+```sh
+chmod +x ./barroso-wispr-darwin-arm64
+# Only needed for a download quarantined by your browser:
+xattr -d com.apple.quarantine ./barroso-wispr-darwin-arm64
+export WISPR_API_KEY="your-google-ai-studio-key" # or your bk- Barroso Keys key
+./barroso-wispr-darwin-arm64 --install
+```
+
+The installer creates `~/Applications/Barroso Wispr.app`, registers it to start
+at every login, and starts it now. It does not require an administrator password.
+On first use, macOS asks for permission to access the microphone, monitor input,
+and control the computer. If a prompt was dismissed, grant access in **System
+Settings → Privacy & Security → Microphone**, **Input Monitoring**, and
+**Accessibility**. Quit and reopen the app after changing these permissions.
+
+The recording indicator is a blue pulsing border around the desktop and does
+not intercept mouse input. Updates are downloaded and applied while the app is
+idle; the installed app is replaced without an administrator password. The
+installer tries to create a stable local signing identity so macOS can retain
+permissions across updates. If local signing is unavailable, it falls back to
+ad-hoc signing and macOS may ask for the permissions again after an update.
+
+Set `WISPR_API_KEY` in your shell before installing; the installer copies its
+value into the private (0600) LaunchAgent configuration so the app can access
+the key after login. Keep that plist private and reinstall after changing the
+key. For a one-off foreground run without installing, run the binary directly
+from Terminal after setting the variable in that shell.
+
 ## Credential setup
 
 Set exactly one environment variable: `WISPR_API_KEY`. The backend is selected
 from the key prefix; there is no URL or provider setting:
 
-- Keys starting with `bk_` use `https://keys.barroso.tec.br/v1`, voice model
+- Keys starting with `bk-` use `https://keys.barroso.tec.br/v1`, voice model
   `barroso-audio-stream` (the gateway selects the real chain model via
   `x-served-model`) and cleanup model `barroso-quick`.
 - Any other key is sent to Google AI Studio. Create a key at
@@ -67,7 +101,7 @@ from the key prefix; there is no URL or provider setting:
 
 ```powershell
 [Environment]::SetEnvironmentVariable("WISPR_API_KEY", "your-google-ai-studio-key", "User")
-# or: [Environment]::SetEnvironmentVariable("WISPR_API_KEY", "bk_your-barroso-keys-key", "User")
+# or: [Environment]::SetEnvironmentVariable("WISPR_API_KEY", "bk-your-barroso-keys-key", "User")
 ```
 
 Sign out and back in (or reopen the terminal) after setting the user variable.

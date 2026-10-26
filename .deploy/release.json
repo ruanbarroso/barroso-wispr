@@ -2,11 +2,35 @@
   "base_version": "v0.1.0",
   "suffix": "bw",
   "title": "Barroso Wispr",
-  "notes": "Barroso Wispr — live voice dictation in Go: hold Left Ctrl + Left Alt, speak, release, and the text is pasted where the cursor is. Streams to the Gemini Live API through Barroso Keys (bk- keys) or Google AI Studio directly. Windows only for now. Set WISPR_API_KEY and run barroso-wispr-windows-amd64.exe. https://wispr.barroso.tec.br",
+  "notes": "Barroso Wispr \u2014 live voice dictation for macOS and Windows: hold Left Ctrl + Left Alt/Option, speak, release, and the text is pasted where the cursor is. Streams to the Gemini Live API through Barroso Keys (bk- keys) or Google AI Studio directly. Set WISPR_API_KEY. macOS: run barroso-wispr-darwin-arm64 --install. Windows: run barroso-wispr-windows-amd64.exe --install as Administrator. https://wispr.barroso.tec.br",
   "version_var": "main.Versao",
   "vet": true,
   "targets": [
-    { "package": "./cmd/barroso-wispr", "name": "barroso-wispr-windows-amd64.exe", "goos": "windows", "goarch": "amd64", "gui": true },
-    { "package": "./cmd/barroso-wispr", "name": "barroso-wispr-windows-arm64.exe", "goos": "windows", "goarch": "arm64", "gui": true }
+    {
+      "package": "./cmd/barroso-wispr",
+      "name": "barroso-wispr-windows-amd64.exe",
+      "goos": "windows",
+      "goarch": "amd64",
+      "gui": true
+    },
+    {
+      "package": "./cmd/barroso-wispr",
+      "name": "barroso-wispr-windows-arm64.exe",
+      "goos": "windows",
+      "goarch": "arm64",
+      "gui": true
+    },
+    {
+      "package": "./cmd/barroso-wispr",
+      "name": "barroso-wispr-darwin-arm64",
+      "goos": "darwin",
+      "goarch": "arm64"
+    },
+    {
+      "package": "./cmd/barroso-wispr",
+      "name": "barroso-wispr-darwin-amd64",
+      "goos": "darwin",
+      "goarch": "amd64"
+    }
   ]
 }
