@@ -41,7 +41,29 @@ func run() int {
 	versao := flag.Bool("version", false, "mostra a versão")
 	instalar := flag.Bool("install", false, "instala o app e o inicia")
 	arquivo := flag.String("arquivo", "", "dita um PCM s16le 16 kHz mono deste arquivo e imprime o texto (diagnóstico, sem microfone nem teclado)")
+	testarColar := flag.String("testar-colar", "", "diagnóstico: espera 2 s e cola este texto no app em foco")
+	simular := flag.String("simular-atalho", "", "diagnóstico: segura Ctrl+Option e fala este texto (say)")
 	flag.Parse()
+	if *simular != "" {
+		if err := simularAtalho(*simular); err != nil {
+			fmt.Fprintln(os.Stderr, "simular:", err)
+			return 1
+		}
+		return 0
+	}
+	if *testarColar != "" {
+		time.Sleep(2 * time.Second)
+		if os.Getenv("BW_TESTE_SONS") != "" {
+			plataforma.BeepDone()
+			plataforma.EstadoProcessando(true)
+			time.Sleep(1500 * time.Millisecond)
+		}
+		if err := plataforma.Colar(*testarColar); err != nil {
+			fmt.Fprintln(os.Stderr, "colar:", err)
+			return 1
+		}
+		return 0
+	}
 	if *versao {
 		fmt.Println(Versao)
 		return 0
@@ -103,6 +125,22 @@ func run() int {
 		mic = &app.MicArquivo{PCM: pcm, Bloco: plataforma.BlocoBytes}
 		feito = make(chan struct{})
 		digitar = func(s string) error { fmt.Println(s); close(feito); return nil }
+	}
+	if f := os.Getenv("BW_DIAG_MIC_PCM"); f != "" && *arquivo == "" {
+		// Diagnóstico: fluxo real (atalho, indicador, sons, colar) com áudio de arquivo.
+		if pcm, err := os.ReadFile(f); err == nil {
+			mic = &app.MicArquivo{PCM: pcm, Bloco: plataforma.BlocoBytes}
+		}
+	}
+	if *arquivo == "" {
+		digitar = func(s string) error {
+			foco := appEmFoco()
+			err := plataforma.Colar(s)
+			if err == nil {
+				fmt.Fprintf(log, "%s colado (%d caracteres) em %q\n", time.Now().Format("15:04:05.000"), len([]rune(s)), foco)
+			}
+			return err
+		}
 	}
 	var indicador *plataforma.Indicador
 	if *arquivo == "" {
