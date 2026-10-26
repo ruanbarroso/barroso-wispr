@@ -13,9 +13,9 @@ import (
 	"github.com/ebitengine/purego/objc"
 )
 
-// Colar no macOS: guarda o texto do pasteboard, põe o ditado (marcado como
-// transitório para gerenciadores de histórico), manda Command+V e devolve o
-// texto anterior. Digitar (eventos Unicode do Quartz) é o plano B.
+// Colar no macOS: põe o ditado no pasteboard (marcado como transitório para
+// gerenciadores de histórico) e manda Command+V. Digitar (eventos Unicode do
+// Quartz) é o plano B.
 
 const (
 	cgEventSourceUserData = 42
@@ -123,23 +123,15 @@ func colarPasteboard(texto string) error {
 			err = errors.New("NSPasteboard indisponível")
 			return
 		}
-		tipoTexto := nsString("public.utf8-plain-text")
-		anterior := pb.Send(objc.RegisterName("stringForType:"), tipoTexto)
-		if anterior != 0 {
-			// Copia: o objeto do pasteboard pode ser invalidado por clearContents.
-			anterior = anterior.Send(objc.RegisterName("copy"))
-			defer anterior.Send(objc.RegisterName("release"))
-		}
+		// No macOS o pasteboard NÃO é restaurado: com a restauração, o Chrome
+		// só colava o primeiro ditado e os seguintes entravam vazios (medido
+		// em 2026-10-26: 5/0/0/0/0 restaurando, 5/5/5/5/5 sem restaurar).
+		// O ditado fica no pasteboard, marcado como transitório.
 		if err = gravarPasteboard(pb, texto, true); err != nil {
 			return
 		}
 		enviarCommandV()
 		time.Sleep(esperaColarMac)
-		// Só o texto anterior é restaurado; imagem/arquivo não voltam.
-		if anterior != 0 {
-			pb.Send(objc.RegisterName("clearContents"))
-			pb.Send(objc.RegisterName("setString:forType:"), anterior, tipoTexto)
-		}
 	})
 	return err
 }
