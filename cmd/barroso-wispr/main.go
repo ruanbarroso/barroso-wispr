@@ -1,3 +1,5 @@
+//go:build windows || darwin
+
 // barroso-wispr: ditado por voz ao vivo. Segure Ctrl+Alt (esquerdos) e fale;
 // solte e o texto é digitado onde está o cursor. Dois toques rápidos travam a
 // gravação; um toque encerra.

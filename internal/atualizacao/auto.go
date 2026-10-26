@@ -1,3 +1,5 @@
+//go:build windows || darwin
+
 // Package atualizacao mantém o binário do wispr na última release estável:
 // checa o GitHub uma vez por dia, baixa com verificação de SHA-256 e
 // `-version`, e troca o executável por um helper quando o app está ocioso.

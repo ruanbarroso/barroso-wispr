@@ -1,3 +1,5 @@
+//go:build windows || darwin
+
 package plataforma
 
 // Sons de aviso (iguais em Windows e macOS): tons senoidais suaves com fade,
