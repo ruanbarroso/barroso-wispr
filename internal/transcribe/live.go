@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"sync"
@@ -61,6 +62,10 @@ type quadro struct {
 			Text string `json:"text"`
 		} `json:"inputTranscription"`
 		TurnComplete bool `json:"turnComplete"`
+		// O gemini-3.5-transcribe-live não manda turnComplete: depois do
+		// audioStreamEnd ele entrega a última parcial e, junto, generationComplete
+		// (medido em 2026-10-24, ~0,7 s após o fim de 47 s de fala).
+		GenerationComplete bool `json:"generationComplete"`
 	} `json:"serverContent"`
 	UsageMetadata *struct {
 		PromptTokenCount   int `json:"promptTokenCount"`
@@ -74,14 +79,22 @@ type quadro struct {
 type Sessao struct {
 	conn *websocket.Conn
 
-	mu        sync.Mutex
-	texto     strings.Builder
-	ultima    time.Time // hora da última parcial recebida
-	entrada   int
-	saida     int
-	erroLeit  error
-	terminou  chan struct{}
-	onParcial func(string)
+	mu       sync.Mutex
+	texto    strings.Builder
+	ultima   time.Time // hora da última parcial recebida
+	turno    time.Time // hora do último fim de geração/turno do servidor
+	entrada  int
+	saida    int
+	erroLeit error
+	terminou chan struct{}
+	// encerrando marca que o fim da conexão foi pedido pelo app (Finalizar ou
+	// Fechar). Qualquer fim sem isso — inclusive um fechamento "normal" vindo
+	// do servidor — é queda no meio da gravação.
+	encerrando bool
+	caiu       bool
+	motivo     string
+	onParcial  func(string)
+	quadros    int // quadros do servidor depois do setup (diagnóstico)
 }
 
 // Abrir conecta, manda o setup e espera o setupComplete.
@@ -129,6 +142,10 @@ func (s *Sessao) ler() {
 			if websocket.CloseStatus(err) != websocket.StatusNormalClosure {
 				s.erroLeit = err
 			}
+			if !s.encerrando {
+				s.caiu = true
+				s.motivo = err.Error()
+			}
 			s.mu.Unlock()
 			return
 		}
@@ -137,6 +154,7 @@ func (s *Sessao) ler() {
 			continue
 		}
 		s.mu.Lock()
+		s.quadros++
 		if q.ServerContent != nil && q.ServerContent.InputTranscription != nil && q.ServerContent.InputTranscription.Text != "" {
 			s.texto.WriteString(q.ServerContent.InputTranscription.Text)
 			s.ultima = time.Now()
@@ -147,6 +165,9 @@ func (s *Sessao) ler() {
 				cb(parcial)
 			}
 			s.mu.Lock()
+		}
+		if q.ServerContent != nil && (q.ServerContent.TurnComplete || q.ServerContent.GenerationComplete) {
+			s.turno = time.Now()
 		}
 		if u := q.UsageMetadata; u != nil {
 			// Uso é POR TURNO: soma-se. Pensamento é cobrado como saída.
@@ -166,10 +187,27 @@ func (s *Sessao) EnviarAudio(ctx context.Context, pcm []byte) error {
 	return s.conn.Write(ctx, websocket.MessageText, b)
 }
 
-// Finalizar avisa o fim do áudio e espera a transcrição assentar: devolve
-// quando passa `quieto` sem parcial nova depois do fim, ou no `teto`.
+// folgaTurno é quanto esperar, depois do sinal de fim que chega após o fim do
+// áudio, por alguma parcial atrasada antes de devolver o texto.
+const folgaTurno = 300 * time.Millisecond
+
+// folgaVazio é a espera depois de um fim de geração sem nenhuma parcial.
+const folgaVazio = 1 * time.Second
+
+// Finalizar avisa o fim do áudio e espera a transcrição assentar. O caminho
+// normal é o sinal do servidor: generationComplete (ou turnComplete) depois
+// do audioStreamEnd, mais uma folga curta. Sem esse sinal, devolve quando passa
+// `quieto` sem parcial nova depois do fim, ou no `teto`.
+//
+// O silêncio conta a partir do mais recente entre o fim do áudio e a última
+// parcial, e quem chama aumenta `quieto` com a duração da gravação: em fala
+// longa o modelo ainda transcreve os últimos segundos depois do fim, e um
+// `quieto` curto devolvia só o começo do ditado.
 func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (string, error) {
 	b, _ := json.Marshal(map[string]any{"realtimeInput": map[string]any{"audioStreamEnd": true}})
+	s.mu.Lock()
+	s.encerrando = true
+	s.mu.Unlock()
 	fim := time.Now()
 	if err := s.conn.Write(ctx, websocket.MessageText, b); err != nil {
 		return s.Texto(), err
@@ -188,16 +226,25 @@ func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (str
 			return s.Texto(), nil
 		case <-tick.C:
 			s.mu.Lock()
-			ultima, temTexto := s.ultima, s.texto.Len() > 0
+			ultima, turno, temTexto := s.ultima, s.turno, s.texto.Len() > 0
 			s.mu.Unlock()
-			// Silêncio conta a partir do mais recente entre o fim do áudio e a
-			// última parcial. Exigir parcial DEPOIS do fim travava até o teto
-			// quando a frase curta já tinha sido transcrita antes de soltar.
 			ref := fim
 			if ultima.After(ref) {
 				ref = ultima
 			}
-			if temTexto && time.Since(ref) >= quieto {
+			if !temTexto {
+				// O modelo declarou o fim sem transcrever nada: espera um pouco
+				// por uma parcial atrasada e desiste, em vez de ir até o teto —
+				// quem chama ainda tem a transcrição de reserva para tentar.
+				if turno.After(fim) && time.Since(turno) >= folgaVazio {
+					return "", nil
+				}
+				continue
+			}
+			if turno.After(fim) && time.Since(ref) >= folgaTurno && time.Since(turno) >= folgaTurno {
+				return s.Texto(), nil
+			}
+			if time.Since(ref) >= quieto {
 				return s.Texto(), nil
 			}
 		}
@@ -226,5 +273,27 @@ func (s *Sessao) Uso() (entrada, saida int) {
 
 // Fechar encerra a conexão.
 func (s *Sessao) Fechar() {
+	s.mu.Lock()
+	s.encerrando = true
+	s.mu.Unlock()
 	_ = s.conn.Close(websocket.StatusNormalClosure, "")
+}
+
+// Diagnostico resume o que o servidor mandou, para o log de "nada transcrito".
+func (s *Sessao) Diagnostico() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fimGer := "não"
+	if !s.turno.IsZero() {
+		fimGer = "sim"
+	}
+	return fmt.Sprintf("%d quadro(s) do servidor, generationComplete: %s", s.quadros, fimGer)
+}
+
+// Caiu informa se a conexão terminou sem o app pedir — rede, cota, limite de
+// sessão ou fechamento do servidor — e o motivo, para o log.
+func (s *Sessao) Caiu() (bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.caiu, s.motivo
 }

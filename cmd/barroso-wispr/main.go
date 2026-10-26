@@ -67,6 +67,13 @@ func run() int {
 		mostrarMensagem("Barroso Wispr", "Não foi possível abrir wispr.log.\n\n"+logErr.Error())
 	}
 
+	if *arquivo == "" {
+		// Uma única cópia escuta o atalho: a mais nova fecha as anteriores.
+		if err := instalacao.EncerrarOutrasCopias(); err != nil {
+			fmt.Fprintf(log, "barroso-wispr: não foi possível fechar outra cópia em execução: %v\n", err)
+		}
+	}
+
 	pref := config.Carregar()
 	dest, err := config.Resolver(pref)
 	if err != nil {
@@ -116,9 +123,14 @@ func run() int {
 		Dicionario: func() []string { return config.Dicionario(pref.Dicionario) },
 		ModeloVoz:  dest.Modelo,
 		ModeloQuik: dest.QuickModel,
-		BeepReady:  plataforma.BeepReady,
-		BeepDone:   plataforma.BeepDone,
-		Log:        log,
+		Transcrever: func(ctx context.Context, pcm []byte) (string, error) {
+			return gw.Transcrever(ctx, dest.STTModel, gateway.WAV(pcm, plataforma.TaxaAmostras))
+		},
+		BeepReady:         plataforma.BeepReady,
+		BeepDone:          plataforma.BeepDone,
+		BeepErro:          plataforma.BeepErro,
+		EstadoProcessando: plataforma.EstadoProcessando,
+		Log:               log,
 	}
 	if indicador != nil {
 		deps.EstadoGravacao = indicador.SetActive

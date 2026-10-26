@@ -55,6 +55,10 @@ type Operations struct {
 	RegisterTask   func(name, xml string) error
 	UnregisterTask func(name string) error
 	Launch         func(exe string, args []string, dir string) error
+	// StopRunning encerra as cópias do app que rodam a partir de installDir.
+	// Sem isso a versão antiga continua aberta ao lado da nova (cada ditado
+	// sai duas vezes) e o backup dela fica preso, travando a instalação seguinte.
+	StopRunning func(installDir string) error
 }
 
 // Install checks elevation first, then copies the running executable to
@@ -113,6 +117,9 @@ func Install(deps Deps) error {
 	if err := ops.MkdirAll(installDir, 0o755); err != nil {
 		return fmt.Errorf("create installation directory: %w", err)
 	}
+	if err := ops.StopRunning(installDir); err != nil {
+		return fmt.Errorf("stop running Barroso Wispr: %w", err)
+	}
 
 	backup, hadTarget, err := atomicInstall(source, target, ops)
 	if err != nil {
@@ -142,6 +149,12 @@ func Install(deps Deps) error {
 	}
 	if hadTarget {
 		_ = ops.Remove(backup) // best effort cleanup after installation commits
+	}
+	// Sobras de instalações anteriores cujo backup estava em uso na hora.
+	if stale, err := filepath.Glob(target + ".install-backup*"); err == nil {
+		for _, f := range stale {
+			_ = ops.Remove(f)
+		}
 	}
 	return nil
 }
@@ -198,6 +211,9 @@ func (ops Operations) withDefaults() Operations {
 	if ops.Launch == nil {
 		ops.Launch = launch
 	}
+	if ops.StopRunning == nil {
+		ops.StopRunning = stopRunning
+	}
 	return ops
 }
 
@@ -239,11 +255,9 @@ func atomicInstall(source, target string, ops Operations) (backup string, hadTar
 
 	if _, err := ops.Stat(target); err == nil {
 		hadTarget = true
-		backup = target + ".install-backup"
-		if _, statErr := ops.Stat(backup); statErr == nil {
-			return "", false, fmt.Errorf("refusing to overwrite existing rollback file %s", backup)
-		} else if !os.IsNotExist(statErr) {
-			return "", false, statErr
+		backup, err = freeBackup(target, ops)
+		if err != nil {
+			return "", false, err
 		}
 		if err := ops.Replace(tmpPath, target, backup); err != nil {
 			// ReplaceFileW may have preserved the old target as backup before
@@ -267,6 +281,29 @@ func atomicInstall(source, target string, ops Operations) (backup string, hadTar
 	}
 	committed = true
 	return backup, hadTarget, nil
+}
+
+// freeBackup devolve um nome livre para o backup do executável atual. Um
+// backup que sobrou de uma instalação anterior é de uma versão já substituída:
+// é apagado; se ainda estiver em uso e não puder ser apagado, usa o próximo nome.
+func freeBackup(target string, ops Operations) (string, error) {
+	for i := 0; i < 100; i++ {
+		name := target + ".install-backup"
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d", name, i)
+		}
+		_, err := ops.Stat(name)
+		if os.IsNotExist(err) {
+			return name, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if ops.Remove(name) == nil {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no free rollback file name next to %s", target)
 }
 
 func rollbackExecutable(target, backup string, hadTarget bool, ops Operations) error {
@@ -366,6 +403,63 @@ func unregisterTask(name string) error {
 		return fmt.Errorf("schtasks /Delete: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// stopRunning encerra os processos (exceto este) cujo executável está em
+// installDir e se chama barroso-wispr.exe ou um backup dele — a cópia antiga em
+// execução continua aberta mesmo depois de renomeada para backup.
+func stopRunning(installDir string) error {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(snap)
+	self := uint32(os.Getpid())
+	dir := strings.ToLower(filepath.Clean(installDir)) + `\`
+	prefix := strings.ToLower(ExecutableName)
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	var errs []error
+	for err = windows.Process32First(snap, &entry); err == nil; err = windows.Process32Next(snap, &entry) {
+		if entry.ProcessID == self || entry.ProcessID == 0 {
+			continue
+		}
+		name := strings.ToLower(windows.UTF16ToString(entry.ExeFile[:]))
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, entry.ProcessID)
+		if err != nil {
+			continue // processo de outro lugar ou que já saiu
+		}
+		buf := make([]uint16, windows.MAX_LONG_PATH)
+		size := uint32(len(buf))
+		if windows.QueryFullProcessImageName(h, 0, &buf[0], &size) == nil {
+			image := strings.ToLower(windows.UTF16ToString(buf[:size]))
+			if strings.HasPrefix(image, dir) && !strings.Contains(image[len(dir):], `\`) {
+				if err := windows.TerminateProcess(h, 0); err != nil {
+					errs = append(errs, fmt.Errorf("pid %d: %w", entry.ProcessID, err))
+				} else {
+					_, _ = windows.WaitForSingleObject(h, 5000)
+				}
+			}
+		}
+		windows.CloseHandle(h)
+	}
+	return errors.Join(errs...)
+}
+
+// EncerrarOutrasCopias fecha as outras cópias do app que rodam da mesma pasta
+// deste executável: a que subiu por último vale. Sem isso, um Stop/Start da
+// tarefa de logon deixava a cópia lançada pelo auxiliar de atualização viva
+// (2026-10-25: bw.13 e bw.15 rodando juntas, o atalho disparando nas duas).
+// Melhor esforço: uma cópia sem elevação não consegue fechar uma elevada.
+func EncerrarOutrasCopias() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return stopRunning(filepath.Dir(exe))
 }
 
 func launch(exe string, args []string, dir string) error {

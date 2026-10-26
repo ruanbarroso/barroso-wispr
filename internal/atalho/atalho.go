@@ -113,6 +113,13 @@ func (m *Maquina) Gravando() bool {
 	return m.st == gravando || m.st == travado || m.st == soltandoTrava
 }
 
+// Apertado informa se a combinação acabou de ser pressionada (um toque que
+// ainda não virou gravação segurada). O app usa para reconhecer um toque dado
+// com o atalho ocioso e, se ainda assim houver gravação ligada, encerrá-la:
+// é a rede de segurança do caso em que a máquina e a gravação discordavam e
+// nenhum gesto desligava o microfone.
+func (m *Maquina) Apertado() bool { return m.st == apertado }
+
 // Reset volta ao estado ocioso sem devolver eventos; o chamador já sabe o que
 // fazer (encerrar um ditado em curso ou abortar uma troca de processo).
 func (m *Maquina) Reset() {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,23 +28,33 @@ type Sessao interface {
 	Finalizar(ctx context.Context, quieto, teto time.Duration) (string, error)
 	Uso() (entrada, saida int)
 	Fechar()
+	// Caiu diz se a conexão terminou sem o app pedir, e por quê.
+	Caiu() (bool, string)
 }
 
 // Deps são as dependências injetáveis (o teste troca todas).
 type Deps struct {
-	Gateway        *gateway.Cliente
-	Chat           limpeza.Chat
-	Abrir          func(ctx context.Context, token, modeloReal, instrucao string) (Sessao, error)
-	Microfone      Microfone
-	Digitar        func(string) error
-	Dicionario     func() []string
-	ModeloVoz      string
-	ModeloQuik     string
-	Log            io.Writer
-	BeepReady      func()
-	BeepDone       func()
-	EstadoGravacao func(bool)
+	Gateway           *gateway.Cliente
+	Chat              limpeza.Chat
+	Abrir             func(ctx context.Context, token, modeloReal, instrucao string) (Sessao, error)
+	Microfone         Microfone
+	Digitar           func(string) error
+	Dicionario        func() []string
+	ModeloVoz         string
+	ModeloQuik        string
+	Log               io.Writer
+	BeepReady         func()
+	BeepDone          func()
+	BeepErro          func() // no lugar do BeepDone quando a gravação parou sozinha
+	EstadoGravacao    func(bool)
+	EstadoProcessando func(bool)
+	// Transcrever é a reserva: transcreve o áudio inteiro do ditado de uma vez
+	// quando a Live não devolve texto. Opcional.
+	Transcrever func(ctx context.Context, pcm []byte) (string, error)
 }
+
+// diagnosticavel é a sessão que sabe resumir o que o servidor mandou.
+type diagnosticavel interface{ Diagnostico() string }
 
 // App mantém a máquina do atalho e a gravação em curso.
 type App struct {
@@ -53,6 +64,8 @@ type App struct {
 	rec *gravacao
 
 	ativos   int // inclui finalização, limpeza e colagem após rec ser limpo
+	lote     *lote
+	proc     int // ditados processando; o pulso toca enquanto > 0
 	trocaPed bool
 	trocando bool
 	troca    func() bool
@@ -64,6 +77,14 @@ type App struct {
 	tokPrev  *gateway.Token
 	tokEm    time.Time
 	tokBusca chan struct{} // fecha quando o pedido em andamento termina
+}
+
+// lote junta os ditados que se sobrepõem: um ditado começado enquanto o
+// anterior ainda não foi colado entra no mesmo lote, e o lote só é colado,
+// de uma vez e na ordem de fala, quando todos os ditados dele terminaram.
+type lote struct {
+	partes []string
+	feitos int
 }
 
 // validadeToken fica abaixo dos 60 s que o token tem para abrir uma sessão
@@ -127,8 +148,13 @@ type gravacao struct {
 	sessao   Sessao
 	token    gateway.Token
 	err      error
+	caiu     bool
+	lote     *lote
+	parte    int // posição deste ditado no lote
 	mu       sync.Mutex
 	pendente [][]byte // áudio capturado antes de a sessão abrir
+	audio    []byte   // todo o áudio do ditado, para a transcrição de reserva
+	bytesAud int
 	// captureMu/capturando controlam o callback de estado da captura, isolado
 	// do beep: o microfone já desligou, mas a finalização/colagem ainda segue.
 	captureMu              sync.Mutex
@@ -239,50 +265,112 @@ func (a *App) Tick() {
 	a.tratar(a.comMaq(func(m *atalho.Maquina) atalho.Evento { return m.Tick(time.Now()) }))
 }
 
-func (a *App) comMaq(f func(*atalho.Maquina) atalho.Evento) atalho.Evento {
+// acao é o que o atalho decidiu, já aplicado ao estado do app: a gravação
+// que começou (reservada em a.rec) ou a que foi retirada de a.rec para parar.
+type acao struct {
+	comecar  *gravacao
+	parar    *gravacao
+	entregar bool
+}
+
+// comMaq decide e aplica o evento do atalho sob o MESMO lock: a máquina do
+// atalho e a.rec nunca discordam. Antes, Tick (outra goroutine) e Soltou
+// decidiam sob o lock mas só registravam a gravação depois de soltá-lo; com
+// toques rápidos o Parar corria antes de o Comecar registrar a gravação, não
+// achava nada, e a gravação ficava ligada com o atalho achando que estava
+// ocioso — nenhum toque a desligava.
+func (a *App) comMaq(f func(*atalho.Maquina) atalho.Evento) acao {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.trocando {
-		return atalho.Nada
+		return acao{}
 	}
+	gravandoAntes := a.maq.Gravando()
 	e := f(&a.maq)
-	// Com troca pedida, deixa terminar o ditado em curso (Parar/Cancelar
-	// passam), mas não começa outro.
-	if e == atalho.Comecar && a.trocaPed {
-		a.maq.Reset()
-		return atalho.Nada
-	}
-	return e
-}
-
-func (a *App) tratar(e atalho.Evento) {
 	switch e {
 	case atalho.Comecar:
-		a.comecar()
-	case atalho.Parar:
-		go a.parar(true)
-	case atalho.Cancelar:
-		go a.parar(false)
+		if a.trocaPed {
+			// Com troca pedida, deixa terminar o ditado em curso, mas não começa outro.
+			a.maq.Reset()
+			return acao{}
+		}
+		if a.rec != nil {
+			// Rede de segurança: o atalho achava que não havia gravação, mas
+			// havia. O gesto de começar encerra a que está ligada.
+			a.maq.Reset()
+			return a.retirarRec(true)
+		}
+		return acao{comecar: a.reservar()}
+	case atalho.Parar, atalho.Cancelar:
+		return a.retirarRec(e == atalho.Parar)
+	}
+	// Rede de segurança: um toque com o atalho ocioso e uma gravação ligada
+	// (não deveria acontecer) encerra a gravação em vez de ser ignorado.
+	if !gravandoAntes && !a.maq.Gravando() && a.rec != nil && e == atalho.Nada && a.maq.Apertado() {
+		a.maq.Reset()
+		return a.retirarRec(true)
+	}
+	return acao{}
+}
+
+// retirarRec tira a gravação em curso de a.rec; a.mu deve estar travado.
+func (a *App) retirarRec(entregar bool) acao {
+	g := a.rec
+	a.rec = nil
+	if g == nil {
+		return acao{}
+	}
+	return acao{parar: g, entregar: entregar}
+}
+
+func (a *App) tratar(x acao) {
+	if x.parar != nil {
+		go a.encerrar(x.parar, x.entregar)
+	}
+	if x.comecar != nil {
+		a.iniciar(x.comecar)
 	}
 }
 
-// comecar liga o microfone NA HORA e abre a sessão em paralelo: o áudio do
-// primeiro meio segundo fica em buffer e é enviado quando o setup completa,
-// para não perder a primeira palavra.
+// reservar cria a gravação e a registra em a.rec; a.mu deve estar travado.
+func (a *App) reservar() *gravacao {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	g := &gravacao{ctx: ctx, cancel: cancel, inicio: time.Now(), pronta: make(chan struct{})}
+	if a.lote == nil {
+		a.lote = &lote{}
+	}
+	g.lote, g.parte = a.lote, len(a.lote.partes)
+	a.lote.partes = append(a.lote.partes, "")
+	a.rec = g
+	a.ativos++
+	return g
+}
+
+// comecar reserva e inicia uma gravação fora do atalho (diagnóstico e testes).
 func (a *App) comecar() {
 	a.mu.Lock()
 	if a.rec != nil || a.trocaPed || a.trocando {
 		a.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	g := &gravacao{ctx: ctx, cancel: cancel, inicio: time.Now(), pronta: make(chan struct{})}
-	a.rec = g
-	a.ativos++
+	g := a.reservar()
 	a.mu.Unlock()
+	a.iniciar(g)
+}
+
+// iniciar liga o microfone NA HORA e abre a sessão em paralelo: o áudio de
+// antes do setup fica em buffer e é enviado quando ele completa. A borda azul
+// e o som de entrada só aparecem quando a sessão abriu: o usuário fala
+// depois de ver a borda, e a partir dali o áudio vai direto para a Live.
+func (a *App) iniciar(g *gravacao) {
+	ctx := g.ctx
 	err := a.d.Microfone.Iniciar(func(pcm []byte) {
 		b := append([]byte(nil), pcm...)
 		g.mu.Lock()
+		if a.d.Transcrever != nil {
+			g.audio = append(g.audio, b...)
+		}
+		g.bytesAud += len(b)
 		if g.sessao == nil {
 			g.pendente = append(g.pendente, b)
 			g.mu.Unlock()
@@ -292,18 +380,10 @@ func (a *App) comecar() {
 		g.mu.Unlock()
 		_ = s.EnviarAudio(g.ctx, b)
 	})
+	micOK := err == nil
 	if err != nil {
 		a.logf("microfone: %v", err)
 		a.notificarEstadoGravacao(g, false)
-	} else {
-		if !a.notificarEstadoGravacao(g, true) {
-			// A gravação pode ter sido encerrada enquanto Iniciar ainda rodava.
-			a.d.Microfone.Parar()
-		} else if a.d.BeepReady != nil {
-			// O microfone já grava desde aqui; o áudio fica em buffer até a sessão
-			// abrir. Então já dá para falar — não precisa esperar a conexão.
-			a.d.BeepReady()
-		}
 	}
 
 	go func() {
@@ -340,7 +420,58 @@ func (a *App) comecar() {
 		for _, b := range pend {
 			_ = s.EnviarAudio(ctx, b)
 		}
+		// Só agora está pronto para ouvir: acende a borda e toca a entrada. Se
+		// o usuário já soltou, notificar devolve false e nada aparece.
+		if micOK && a.notificarEstadoGravacao(g, true) {
+			a.logf("pronto para falar")
+			if a.d.BeepReady != nil {
+				a.d.BeepReady()
+			}
+		}
 	}()
+	go a.vigiarConexao(g)
+}
+
+// vigiarConexao encerra o ditado no instante em que a sessão Live falha ou
+// cai no meio da gravação. Antes o usuário continuava falando sem nada ser
+// transcrito e só descobria no fim, com o texto cortado: agora toca o som de
+// erro, a borda some e o que já foi transcrito é colado no cursor.
+func (a *App) vigiarConexao(g *gravacao) {
+	select {
+	case <-g.pronta:
+	case <-g.ctx.Done():
+		return
+	}
+	motivo := ""
+	if g.err != nil {
+		motivo = g.err.Error()
+	} else {
+		tick := time.NewTicker(200 * time.Millisecond)
+		defer tick.Stop()
+		for motivo == "" {
+			select {
+			case <-g.ctx.Done():
+				return
+			case <-tick.C:
+				if caiu, m := g.sessao.Caiu(); caiu {
+					motivo = m
+				}
+			}
+		}
+	}
+	a.mu.Lock()
+	if a.rec != g {
+		a.mu.Unlock()
+		return // o usuário já tinha encerrado
+	}
+	a.rec = nil
+	a.maq.Reset() // um próximo Ctrl+Alt começa ditado novo, não "encerra" este
+	a.mu.Unlock()
+	g.mu.Lock()
+	g.caiu = true
+	g.mu.Unlock()
+	a.logf("a gravação parou sozinha: %s", motivo)
+	a.encerrar(g, true)
 }
 
 func (a *App) parar(entregar bool) {
@@ -351,14 +482,34 @@ func (a *App) parar(entregar bool) {
 	if g == nil {
 		return
 	}
+	a.encerrar(g, entregar)
+}
+
+// encerrar desliga a captura de g e, se entregar, transcreve e cola.
+func (a *App) encerrar(g *gravacao, entregar bool) {
 	defer g.cancel()
 	defer a.terminouDitado() // roda por último: depois da colagem e do Fechar
 	// Depois de um ditado costuma vir outro: deixa o próximo token pronto.
 	defer a.Aquecer()
 	a.d.Microfone.Parar()
 	a.notificarEstadoGravacao(g, false)
-	if a.d.BeepDone != nil {
-		a.d.BeepDone()
+	if entregar {
+		a.processando(1)
+		defer a.processando(-1)
+	}
+	// Roda antes dos defers acima: o texto (ou nada, se falhou ou foi
+	// cancelado) sempre libera a vaga deste ditado no lote.
+	texto := ""
+	defer func() { a.entregar(g, texto) }()
+	beepFim := a.d.BeepDone
+	g.mu.Lock()
+	caiu := g.caiu
+	g.mu.Unlock()
+	if caiu && a.d.BeepErro != nil {
+		beepFim = a.d.BeepErro
+	}
+	if beepFim != nil {
+		beepFim()
 	}
 	if !entregar {
 		a.logf("gravação cancelada")
@@ -378,11 +529,14 @@ func (a *App) parar(entregar bool) {
 		a.reportarUso(g)
 		return
 	}
-	cru, err := s.Finalizar(g.ctx, 700*time.Millisecond, 8*time.Second)
+	quieto, teto := esperaFinal(solto.Sub(g.inicio))
+	cru, err := s.Finalizar(g.ctx, quieto, teto)
 	a.reportarUso(g)
 	if err != nil && cru == "" {
 		a.logf("transcrição: %v", err)
-		return
+	}
+	if cru == "" {
+		cru = a.reserva(g, s)
 	}
 	tCru := time.Since(solto)
 	if cru == "" {
@@ -394,9 +548,112 @@ func (a *App) parar(entregar bool) {
 		a.logf("limpeza falhou, digitando o cru: %v", err)
 	}
 	a.logf("cru em %v, final em %v: %q", tCru.Round(time.Millisecond), time.Since(solto).Round(time.Millisecond), final)
-	if err := a.d.Digitar(final); err != nil {
+	texto = final
+}
+
+// minReserva é o mínimo de áudio (0,5 s a 16 kHz s16le) para valer a reserva.
+const minReserva = 16000 * 2 / 2
+
+// reserva transcreve o áudio inteiro do ditado quando a Live terminou sem
+// texto. Em 2026-10-25 19:49 a Live abriu, recebeu 3 s de fala e não devolveu
+// nada: com a borda acesa o usuário falou, e o texto tem de sair.
+func (a *App) reserva(g *gravacao, s Sessao) string {
+	diag := ""
+	if d, ok := s.(diagnosticavel); ok {
+		diag = " (" + d.Diagnostico() + ")"
+	}
+	g.mu.Lock()
+	pcm := g.audio
+	g.audio = nil
+	g.mu.Unlock()
+	if a.d.Transcrever == nil || len(pcm) < minReserva {
+		if diag != "" {
+			a.logf("Live sem texto%s", diag)
+		}
+		return ""
+	}
+	a.logf("Live sem texto%s; transcrevendo %v de áudio pela reserva", diag,
+		(time.Duration(len(pcm)) * time.Second / 32000).Round(100*time.Millisecond))
+	ctx, cancel := context.WithTimeout(g.ctx, 60*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	texto, err := a.d.Transcrever(ctx, pcm)
+	if err != nil {
+		a.logf("reserva falhou: %v", err)
+		return ""
+	}
+	a.logf("reserva em %v", time.Since(t0).Round(time.Millisecond))
+	return strings.TrimSpace(texto)
+}
+
+// entregar guarda o texto do ditado no lote e, se ele era o último pendente,
+// cola o lote inteiro de uma vez. Enquanto houver ditado gravando ou
+// processando no lote, nada é colado.
+func (a *App) entregar(g *gravacao, texto string) {
+	a.mu.Lock()
+	l := g.lote
+	l.partes[g.parte] = strings.TrimSpace(texto)
+	l.feitos++
+	if l.feitos < len(l.partes) {
+		a.mu.Unlock()
+		if texto != "" {
+			a.logf("texto guardado; esperando %d ditado(s) do lote", len(l.partes)-l.feitos)
+		}
+		return
+	}
+	if a.lote == l {
+		a.lote = nil
+	}
+	a.mu.Unlock()
+	var partes []string
+	for _, p := range l.partes {
+		if p != "" {
+			partes = append(partes, p)
+		}
+	}
+	if len(partes) == 0 {
+		return
+	}
+	if len(partes) > 1 {
+		a.logf("colando %d ditados juntos", len(partes))
+	}
+	if err := a.d.Digitar(strings.Join(partes, " ")); err != nil {
 		a.logf("digitar: %v", err)
 	}
+}
+
+// processando conta os ditados em transcrição/limpeza: o pulso liga no
+// primeiro e só desliga quando o último termina.
+func (a *App) processando(delta int) {
+	a.mu.Lock()
+	antes := a.proc
+	a.proc += delta
+	depois := a.proc
+	a.mu.Unlock()
+	if a.d.EstadoProcessando == nil {
+		return
+	}
+	if antes == 0 && depois > 0 {
+		a.d.EstadoProcessando(true)
+	} else if antes > 0 && depois == 0 {
+		a.d.EstadoProcessando(false)
+	}
+}
+
+// esperaFinal dá o silêncio e o teto da espera pela transcrição final,
+// crescendo com a duração da gravação. Com 0,7 s fixo, um ditado de 33 s ou
+// 1min35s voltava cortado: o modelo ainda transcrevia o fim quando o app
+// considerava o texto pronto.
+func esperaFinal(gravado time.Duration) (quieto, teto time.Duration) {
+	quieto = 1200*time.Millisecond + gravado/20
+	if quieto > 4*time.Second {
+		quieto = 4 * time.Second
+	}
+	teto = 8*time.Second + gravado/4
+	if teto > 30*time.Second {
+		teto = 30 * time.Second
+	}
+	return quieto, teto
 }
 
 func (a *App) reportarUso(g *gravacao) {

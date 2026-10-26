@@ -11,9 +11,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Colar insere o texto de uma vez pelo clipboard: guarda o texto que estava
-// lá, põe o ditado, manda Ctrl+V e devolve o conteúdo anterior. Digitar
-// caractere por caractere (SendInput Unicode) fica como plano B.
+// Colar insere o texto de uma vez pelo clipboard: copia tudo o que estava lá
+// (clipboard_copia_windows.go), põe o ditado, manda Ctrl+V e devolve o
+// conteúdo anterior. Digitar caractere por caractere (SendInput Unicode) fica
+// como plano B.
 
 var (
 	procOpenClipboard              = user32.NewProc("OpenClipboard")
@@ -32,6 +33,8 @@ var (
 )
 
 const (
+	cfBitmap      = 2
+	cfDIB         = 8
 	cfUnicodeText = 13
 	gmemMoveable  = 0x0002
 
@@ -61,18 +64,23 @@ func colarClipboard(texto string) error {
 	// de outro app). Na trava, o toque de destravar pode estar seguro ainda.
 	esperarModificadoresSoltos(2 * time.Second)
 
-	anterior, tinhaTexto := lerTexto()
+	// Copia TUDO o que o usuário tinha (texto, print, arquivos...) para
+	// devolver depois do Ctrl+V. Sem cópia, o ditado fica no clipboard.
+	anterior, errCopia := copiarClipboard()
 	if err := gravarTexto(texto, true); err != nil {
 		return err
 	}
+	nossa := sequenciaClipboard()
 	if err := enviarCtrlV(); err != nil {
+		if errCopia == nil {
+			_ = anterior.restaurar()
+		}
 		return err
 	}
 	time.Sleep(esperaColar)
-	// Só o texto anterior é restaurado; imagem/arquivo no clipboard não
-	// voltam (ficam substituídos pelo ditado).
-	if tinhaTexto {
-		_ = gravarTexto(anterior, false)
+	// Se o usuário copiou algo novo nesse intervalo, o clipboard já é dele.
+	if errCopia == nil && sequenciaClipboard() == nossa {
+		_ = anterior.restaurar()
 	}
 	return nil
 }
@@ -146,14 +154,7 @@ func gravarTexto(texto string, foraDoHistorico bool) error {
 		return errors.New("SetClipboardData falhou")
 	}
 	if foraDoHistorico {
-		nome, _ := windows.UTF16PtrFromString("ExcludeClipboardContentFromMonitorProcessing")
-		if f, _, _ := procRegisterClipboardFormatW.Call(uintptr(unsafe.Pointer(nome))); f != 0 {
-			if hv, _, _ := procGlobalAlloc.Call(gmemMoveable, 4); hv != 0 {
-				if r, _, _ := procSetClipboardData.Call(f, hv); r == 0 {
-					procGlobalFree.Call(hv)
-				}
-			}
-		}
+		marcarForaDoHistorico()
 	}
 	return nil
 }

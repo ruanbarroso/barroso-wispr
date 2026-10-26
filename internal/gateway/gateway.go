@@ -5,11 +5,15 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strings"
 	"time"
 )
@@ -205,6 +209,120 @@ func (c *Cliente) LiveFailure(ctx context.Context, requestID string) error {
 		return resumoErro(resp.StatusCode, b)
 	}
 	return nil
+}
+
+// promptTranscricao é o pedido da transcrição de reserva no modo Google.
+const promptTranscricao = "Transcreva exatamente o que é falado neste áudio, no idioma falado. Responda só com a transcrição, sem comentários. Se não houver fala, responda vazio."
+
+// Transcrever transcreve um WAV inteiro de uma vez (reserva para quando a
+// Live não devolve nada). No barroso-keys vai pelo /audio/transcriptions
+// (contrato OpenAI); no Google, pelo Chat Completions com input_audio.
+func (c *Cliente) Transcrever(ctx context.Context, model string, wav []byte) (string, error) {
+	if c.Google {
+		return c.transcreverChat(ctx, model, wav)
+	}
+	var corpo bytes.Buffer
+	mw := multipart.NewWriter(&corpo)
+	_ = mw.WriteField("model", model)
+	_ = mw.WriteField("response_format", "json")
+	// CreateFormFile declara application/octet-stream, e o Gemini recusa esse
+	// mime com 400 em todos os degraus (2026-10-25 20:29, 34 falhas).
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", `form-data; name="file"; filename="ditado.wav"`)
+	h.Set("Content-Type", "audio/wav")
+	fw, err := mw.CreatePart(h)
+	if err != nil {
+		return "", err
+	}
+	if _, err := fw.Write(wav); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/audio/transcriptions", &corpo)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("User-Agent", UserAgent)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", resumoErro(resp.StatusCode, b)
+	}
+	var j struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(b, &j); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(j.Text), nil
+}
+
+func (c *Cliente) transcreverChat(ctx context.Context, model string, wav []byte) (string, error) {
+	resp, err := c.post(ctx, "/chat/completions", map[string]any{
+		"model": model,
+		"messages": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "text", "text": promptTranscricao},
+				{"type": "input_audio", "input_audio": map[string]string{
+					"data": base64.StdEncoding.EncodeToString(wav), "format": "wav",
+				}},
+			},
+		}},
+		"temperature": 0,
+		"stream":      false,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return "", resumoErro(resp.StatusCode, b)
+	}
+	var j struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(b, &j); err != nil {
+		return "", err
+	}
+	if len(j.Choices) == 0 {
+		return "", errors.New("resposta sem choices")
+	}
+	return strings.TrimSpace(j.Choices[0].Message.Content), nil
+}
+
+// WAV embrulha PCM s16le mono num cabeçalho WAV.
+func WAV(pcm []byte, taxa int) []byte {
+	var b bytes.Buffer
+	b.Grow(44 + len(pcm))
+	le := func(v any) { _ = binary.Write(&b, binary.LittleEndian, v) }
+	b.WriteString("RIFF")
+	le(uint32(36 + len(pcm)))
+	b.WriteString("WAVEfmt ")
+	le(uint32(16))
+	le(uint16(1)) // PCM
+	le(uint16(1)) // mono
+	le(uint32(taxa))
+	le(uint32(taxa * 2))
+	le(uint16(2))
+	le(uint16(16))
+	b.WriteString("data")
+	le(uint32(len(pcm)))
+	b.Write(pcm)
+	return b.Bytes()
 }
 
 // Chat faz uma chamada Chat Completions sem stream e devolve o texto.
