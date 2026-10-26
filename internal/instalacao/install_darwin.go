@@ -177,7 +177,8 @@ func Install(deps Deps) error {
 		return tx.rollback(fmt.Errorf("criar a pasta LaunchAgents: %w", err))
 	}
 	tx.plistPath = filepath.Join(launchAgents, LaunchAgentLabel+".plist")
-	plistData, err := LaunchAgentPlist(filepath.Join(targetBundle, "Contents", "MacOS", ExecutableName), apiKey)
+	plistData, err := LaunchAgentPlist(filepath.Join(targetBundle, "Contents", "MacOS", ExecutableName), apiKey,
+		filepath.Join(home, ".barroso-wispr", "stderr.log"))
 	if err != nil {
 		return tx.rollback(fmt.Errorf("montar o LaunchAgent: %w", err))
 	}
@@ -422,7 +423,8 @@ func bundleInfoPlist() string {
 // LaunchAgentPlist returns the per-user launchd definition. The environment
 // variable contains the installing user's current key and is kept private by
 // the installer's 0600 atomic-file write.
-func LaunchAgentPlist(executable, apiKey string) (string, error) {
+// stderrPath guarda panics do Go (o wispr.log só tem o que o app escreve).
+func LaunchAgentPlist(executable, apiKey, stderrPath string) (string, error) {
 	if strings.TrimSpace(executable) == "" || strings.TrimSpace(apiKey) == "" {
 		return "", errors.New("executável e WISPR_API_KEY são obrigatórios")
 	}
@@ -438,6 +440,7 @@ func LaunchAgentPlist(executable, apiKey string) (string, error) {
   <key>ProgramArguments</key><array><string>` + escape(executable) + `</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
+  <key>StandardErrorPath</key><string>` + escape(stderrPath) + `</string>
   <key>EnvironmentVariables</key><dict>
     <key>` + APIKeyEnv + `</key><string>` + escape(apiKey) + `</string>
   </dict>

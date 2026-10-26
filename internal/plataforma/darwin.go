@@ -7,6 +7,7 @@ package plataforma
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -87,42 +88,6 @@ func isDarwinMainThread() bool {
 // without tripping go vet's uintptr check.
 func cPointer(addr uintptr) unsafe.Pointer { return *(*unsafe.Pointer)(unsafe.Pointer(&addr)) }
 
-var (
-	beepOnce  sync.Once
-	beepAlert func(uint32)
-)
-
-// BeepReady e BeepDone tocam sons curtos do sistema ("Tink" ao abrir o
-// microfone, "Pop" ao parar). Sem os sons, cai no alerta preferido do usuário.
-// Falhas são ignoradas: o bipe é só um aviso, nunca bloqueia o ditado.
-func BeepReady() { playSystemBeep("Tink") }
-func BeepDone()  { playSystemBeep("Pop") }
-
-// BeepErro avisa que a gravação parou sozinha (a conexão Live caiu).
-func BeepErro() { playSystemBeep("Basso") }
-
-// EstadoProcessando: no macOS ainda não há pulso de processamento; no-op.
-func EstadoProcessando(ativo bool) {}
-
-func playSystemBeep(name string) {
-	beepOnce.Do(func() {
-		_ = loadDarwinFrameworks(appKitPath)
-		_ = registerDarwinSymbol(audioToolboxPath, "AudioServicesPlaySystemSound", &beepAlert)
-	})
-	tocou := false
-	comPool(func() {
-		if cls := objc.GetClass("NSSound"); cls != 0 {
-			if som := objc.ID(cls).Send(objc.RegisterName("soundNamed:"), nsString(name)); som != 0 {
-				som.Send(objc.RegisterName("stop"))
-				tocou = objc.Send[bool](som, objc.RegisterName("play"))
-			}
-		}
-	})
-	if !tocou && beepAlert != nil {
-		beepAlert(0x1000) // kSystemSoundID_UserPreferredAlert
-	}
-}
-
 func loadDarwinFrameworks(paths ...string) error {
 	for _, path := range paths {
 		if _, err := openDarwinFramework(path); err != nil {
@@ -151,6 +116,10 @@ func cfReleaseRef(ref uintptr) {
 // comPool roda f dentro de um NSAutoreleasePool: goroutines não têm pool e
 // objetos autoreleased (NSString etc.) vazariam a cada ditado.
 func comPool(f func()) {
+	// O pool precisa ser drenado na mesma thread em que foi criado; sem isso o
+	// Go pode migrar a goroutine (ex.: no time.Sleep do colar) e o app cai.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if loadDarwinFrameworks(appKitPath) != nil {
 		f()
 		return

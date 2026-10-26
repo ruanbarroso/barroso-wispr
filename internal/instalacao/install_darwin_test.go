@@ -401,10 +401,10 @@ func TestDefaultLaunchOperationsUseUserDomain(t *testing.T) {
 }
 
 func TestLaunchAgentPlistIsWellFormedAndValidated(t *testing.T) {
-	if _, err := LaunchAgentPlist("/a", ""); err == nil {
+	if _, err := LaunchAgentPlist("/a", "", "/tmp/e.log"); err == nil {
 		t.Fatal("empty key accepted")
 	}
-	data, err := LaunchAgentPlist("/Users/a&b/Applications/Barroso Wispr.app/Contents/MacOS/barroso-wispr", `k<"&'>`)
+	data, err := LaunchAgentPlist("/Users/a&b/Applications/Barroso Wispr.app/Contents/MacOS/barroso-wispr", `k<"&'>`, "/Users/a&b/.barroso-wispr/stderr.log")
 	if err != nil {
 		t.Fatal(err)
 	}
