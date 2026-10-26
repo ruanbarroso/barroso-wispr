@@ -40,7 +40,7 @@ func TestFillEdgePixelsCreatesBlueFadeOnRequestedEdge(t *testing.T) {
 	const width, height = 16, 16
 	for _, side := range []edgeSide{edgeTop, edgeBottom, edgeLeft, edgeRight} {
 		pixels := make([]byte, width*height*4)
-		fillEdgePixels(pixels, width, height, side)
+		fillEdgePixels(pixels, width, height, side, edgeBlue)
 		outerX, outerY := 0, 0
 		switch side {
 		case edgeBottom:
@@ -76,5 +76,15 @@ func TestPulseOpacityIsSubtleAndPeriodic(t *testing.T) {
 	}
 	if got, want := pulseOpacity(150*time.Millisecond), pulseOpacity(2350*time.Millisecond); got != want {
 		t.Fatalf("one cycle apart: got %d, want %d", got, want)
+	}
+}
+
+func TestFillEdgePixelsVerdeNoProcessamento(t *testing.T) {
+	const width, height = 16, 16
+	pixels := make([]byte, width*height*4)
+	fillEdgePixels(pixels, width, height, edgeTop, edgeGreen)
+	// BGRA pré-multiplicado de #34C759 com alfa 180.
+	if got, want := pixels[:4], []byte{62, 139, 36, 180}; string(got) != string(want) {
+		t.Fatalf("pixel externo verde = %v, quer %v", got, want)
 	}
 }

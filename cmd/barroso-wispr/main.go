@@ -174,6 +174,11 @@ func run() int {
 	}
 	if indicador != nil {
 		deps.EstadoGravacao = indicador.SetActive
+		// Entre soltar e colar: pulso sonoro e borda verde.
+		deps.EstadoProcessando = func(ativo bool) {
+			plataforma.EstadoProcessando(ativo)
+			indicador.SetProcessando(ativo)
+		}
 	}
 	a := app.Novo(deps)
 

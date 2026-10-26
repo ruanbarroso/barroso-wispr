@@ -25,8 +25,10 @@ type Indicador struct {
 	ready          chan error
 	closeRequested bool
 	active         atomic.Bool
+	processando    atomic.Bool // transcrevendo: borda verde quando não está gravando
 	notifyPending  atomic.Bool
-	visible        bool // only accessed by the window thread
+	visible        bool      // only accessed by the window thread
+	color          edgeColor // only accessed by the window thread
 	startedAt      time.Time
 	bounds         screenBounds    // only accessed by the window thread
 	surfaces       [4]*edgeSurface // only accessed by the window thread
@@ -80,6 +82,17 @@ func (i *Indicador) Start() error {
 // naturally because the window thread reads the latest state.
 func (i *Indicador) SetActive(active bool) {
 	i.active.Store(active)
+	i.acordar()
+}
+
+// SetProcessando liga a borda verde durante a transcrição. A gravação (azul)
+// tem prioridade quando um ditado novo começa antes de o anterior colar.
+func (i *Indicador) SetProcessando(ativo bool) {
+	i.processando.Store(ativo)
+	i.acordar()
+}
+
+func (i *Indicador) acordar() {
 	if !i.notifyPending.CompareAndSwap(false, true) {
 		return // A wake-up is already queued; the thread will read this store.
 	}
@@ -191,6 +204,7 @@ func (i *Indicador) initialize() error {
 		return errors.New("no active desktop bounds available")
 	}
 	i.bounds = bounds
+	i.color = edgeBlue
 	for side := edgeTop; side <= edgeRight; side++ {
 		s := &edgeSurface{owner: i, side: side}
 		w, h := edgeSize(side, bounds)
@@ -213,7 +227,25 @@ func (i *Indicador) initialize() error {
 }
 
 func (i *Indicador) applyActive() {
-	active := i.active.Load()
+	gravando := i.active.Load()
+	active := gravando || i.processando.Load()
+	if active && i.surfaces[edgeTop] != nil {
+		cor := edgeBlue
+		if !gravando {
+			cor = edgeGreen
+		}
+		if cor != i.color {
+			i.color = cor
+			for _, s := range i.surfaces {
+				if s != nil {
+					s.repaint()
+					if i.visible {
+						s.update(pulseOpacity(time.Since(i.startedAt)))
+					}
+				}
+			}
+		}
+	}
 	if active == i.visible && (!active || i.surfaces[edgeTop] != nil) {
 		return
 	}
@@ -245,7 +277,7 @@ func (i *Indicador) applyActive() {
 }
 
 func (i *Indicador) tick() {
-	if !i.active.Load() {
+	if !i.active.Load() && !i.processando.Load() {
 		i.applyActive()
 		return
 	}
@@ -535,10 +567,17 @@ func (s *edgeSurface) resize(width, height int32) error {
 		return errors.New("CreateDIBSection returned a nil pixel buffer")
 	}
 	s.bitmap, s.bits, s.width, s.height = bitmap, bits, width, height
-	pixelCount := int(width) * int(height)
-	pixels := unsafe.Slice((*byte)(s.bits), pixelCount*4)
-	fillEdgePixels(pixels, int(width), int(height), s.side)
+	s.repaint()
 	return nil
+}
+
+// repaint pinta a faixa na cor atual do indicador.
+func (s *edgeSurface) repaint() {
+	if s.bits == nil || s.width <= 0 || s.height <= 0 {
+		return
+	}
+	pixels := unsafe.Slice((*byte)(s.bits), int(s.width)*int(s.height)*4)
+	fillEdgePixels(pixels, int(s.width), int(s.height), s.side, s.owner.color)
 }
 
 func (s *edgeSurface) update(opacity byte) {
@@ -610,7 +649,15 @@ func min32(a, b int32) int32 {
 
 func winLongParam(value int32) uintptr { return uintptr(uint32(value)) }
 
-func fillEdgePixels(pixels []byte, width, height int, side edgeSide) {
+// edgeColor é a cor da borda: azul gravando, verde transcrevendo.
+type edgeColor struct{ r, g, b uint8 }
+
+var (
+	edgeBlue  = edgeColor{35, 139, 255} // #238BFF
+	edgeGreen = edgeColor{52, 199, 89}  // #34C759
+)
+
+func fillEdgePixels(pixels []byte, width, height int, side edgeSide, cor edgeColor) {
 	if width <= 0 || height <= 0 || len(pixels) < width*height*4 {
 		return
 	}
@@ -632,10 +679,10 @@ func fillEdgePixels(pixels []byte, width, height int, side edgeSide) {
 			}
 			alpha := uint8((edgeThickness - distance) * 180 / edgeThickness)
 			index := (y*width + x) * 4
-			// Premultiplied BGRA for the #238BFF blue edge.
-			pixels[index+0] = uint8(255 * int(alpha) / 255)
-			pixels[index+1] = uint8(139 * int(alpha) / 255)
-			pixels[index+2] = uint8(35 * int(alpha) / 255)
+			// BGRA pré-multiplicado.
+			pixels[index+0] = uint8(int(cor.b) * int(alpha) / 255)
+			pixels[index+1] = uint8(int(cor.g) * int(alpha) / 255)
+			pixels[index+2] = uint8(int(cor.r) * int(alpha) / 255)
 			pixels[index+3] = alpha
 		}
 	}

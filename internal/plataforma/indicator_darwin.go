@@ -13,20 +13,24 @@ import (
 	"github.com/ebitengine/purego/objc"
 )
 
-// Indicador é a borda azul pulsante, sem clique, ao redor de cada tela
-// enquanto grava. Dono do ciclo de vida: a thread principal. Start roda nela
+// Indicador é a borda pulsante, sem clique, ao redor de cada tela: azul
+// enquanto grava, verde enquanto transcreve (entre soltar e colar). Dono do ciclo de vida: a thread principal. Start roda nela
 // antes de Teclado.Rodar (que mantém o NSApplication rodando) e Close depois.
 // SetActive vem de qualquer goroutine e só publica o estado; um timer no run
 // loop principal aplica o estado mais recente (coalesce naturalmente).
 type Indicador struct {
-	mu      sync.Mutex
-	state   indicatorLifecycle
-	active  atomic.Bool
-	id      uintptr
-	windows []objc.ID // só na thread principal
-	visible bool      // só na thread principal
-	timer   uintptr   // CFRunLoopTimerRef; só na thread principal
-	started time.Time
+	mu       sync.Mutex
+	state    indicatorLifecycle
+	active   atomic.Bool
+	proc     atomic.Bool // transcrevendo: borda verde quando não está gravando
+	id       uintptr
+	windows  []objc.ID // só na thread principal
+	visible  bool      // só na thread principal
+	verde    bool      // cor aplicada às janelas; só na thread principal
+	corAzul  objc.ID   // retidas; só na thread principal
+	corVerde objc.ID
+	timer    uintptr // CFRunLoopTimerRef; só na thread principal
+	started  time.Time
 }
 
 type indicatorLifecycle uint8
@@ -165,6 +169,17 @@ func (i *Indicador) Start() error {
 // acorda o run loop principal; o timer aplica em até ~45 ms.
 func (i *Indicador) SetActive(active bool) {
 	i.active.Store(active)
+	i.acordar()
+}
+
+// SetProcessando liga a borda verde durante a transcrição. A gravação (azul)
+// tem prioridade quando um ditado novo começa antes de o anterior colar.
+func (i *Indicador) SetProcessando(ativo bool) {
+	i.proc.Store(ativo)
+	i.acordar()
+}
+
+func (i *Indicador) acordar() {
 	i.mu.Lock()
 	running := i.state == indicatorRunning
 	i.mu.Unlock()
@@ -204,8 +219,13 @@ func (i *Indicador) createWindows() error {
 	if count == 0 {
 		return errors.New("o macOS não informou nenhuma tela ativa")
 	}
-	azul := objc.ID(objc.GetClass("NSColor")).Send(objc.RegisterName("colorWithSRGBRed:green:blue:alpha:"),
-		35.0/255, 139.0/255, 1.0, 0.75)
+	nsColor := objc.ID(objc.GetClass("NSColor"))
+	// Retidas: criadas dentro de um autorelease pool que é drenado em seguida.
+	i.corAzul = nsColor.Send(objc.RegisterName("colorWithSRGBRed:green:blue:alpha:"),
+		35.0/255, 139.0/255, 1.0, 0.75).Send(objc.RegisterName("retain"))
+	i.corVerde = nsColor.Send(objc.RegisterName("colorWithSRGBRed:green:blue:alpha:"),
+		52.0/255, 199.0/255, 89.0/255, 0.75).Send(objc.RegisterName("retain"))
+	azul := i.corAzul
 	for n := uint64(0); n < count; n++ {
 		screen := screens.Send(objc.RegisterName("objectAtIndex:"), n)
 		frame := objc.Send[macRect](screen, objc.RegisterName("frame"))
@@ -240,13 +260,20 @@ func (i *Indicador) destroyWindows() {
 		w.Send(objc.RegisterName("close"))
 		w.Send(objc.RegisterName("release"))
 	}
-	i.windows, i.visible = nil, false
+	i.windows, i.visible, i.verde = nil, false, false
+	for _, c := range []*objc.ID{&i.corAzul, &i.corVerde} {
+		if *c != 0 {
+			c.Send(objc.RegisterName("release"))
+			*c = 0
+		}
+	}
 }
 
 // applyActive roda no timer da thread principal, sempre — inclusive para
 // esconder quando SetActive(false) veio de outra goroutine.
 func (i *Indicador) applyActive() {
-	active := i.active.Load()
+	gravando := i.active.Load()
+	active := gravando || i.proc.Load()
 	if !active && !i.visible {
 		return
 	}
@@ -257,6 +284,16 @@ func (i *Indicador) applyActive() {
 			}
 			i.visible = false
 			return
+		}
+		if verde := !gravando; verde != i.verde {
+			cor := i.corAzul
+			if verde {
+				cor = i.corVerde
+			}
+			for _, w := range i.windows {
+				w.Send(objc.RegisterName("setBackgroundColor:"), cor)
+			}
+			i.verde = verde
 		}
 		alpha := float64(pulseOpacityMac(time.Since(i.started))) / 255
 		for _, w := range i.windows {
