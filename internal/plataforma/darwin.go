@@ -98,6 +98,12 @@ var (
 func BeepReady() { playSystemBeep("Tink") }
 func BeepDone()  { playSystemBeep("Pop") }
 
+// BeepErro avisa que a gravação parou sozinha (a conexão Live caiu).
+func BeepErro() { playSystemBeep("Basso") }
+
+// EstadoProcessando: no macOS ainda não há pulso de processamento; no-op.
+func EstadoProcessando(ativo bool) {}
+
 func playSystemBeep(name string) {
 	beepOnce.Do(func() {
 		_ = loadDarwinFrameworks(appKitPath)
