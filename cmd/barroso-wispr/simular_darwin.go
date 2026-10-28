@@ -16,5 +16,3 @@ func simularAtalho(fala string) error {
 		time.Sleep(500 * time.Millisecond)
 	})
 }
-
-func appEmFoco() string { return plataforma.AppEmFoco() }

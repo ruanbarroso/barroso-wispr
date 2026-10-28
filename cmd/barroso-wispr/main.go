@@ -136,12 +136,13 @@ func run() int {
 	}
 	if *arquivo == "" {
 		digitar = func(s string) error {
-			foco := appEmFoco()
-			err := plataforma.Colar(s)
-			if err == nil {
-				fmt.Fprintf(log, "%s colado (%d caracteres) em %q\n", time.Now().Format("15:04:05.000"), len([]rune(s)), foco)
+			diag, err := plataforma.ColarDiagnostico(s)
+			if err != nil {
+				fmt.Fprintf(log, "%s erro na colagem (%d caracteres): %v; diagnóstico: %s\n", time.Now().Format("15:04:05.000"), len([]rune(s)), err, diag)
+				return err
 			}
-			return err
+			fmt.Fprintf(log, "%s colagem solicitada (%d caracteres; inserção não confirmada pelo SO); diagnóstico: %s\n", time.Now().Format("15:04:05.000"), len([]rune(s)), diag)
+			return nil
 		}
 	}
 	var indicador *plataforma.Indicador

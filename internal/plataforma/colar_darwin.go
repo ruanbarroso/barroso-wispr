@@ -4,6 +4,7 @@ package plataforma
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -94,44 +95,90 @@ func permissaoPostar() error {
 	return errors.New("o macOS não autorizou o envio de teclas: libere o Barroso Wispr em Ajustes do Sistema > Privacidade e Segurança > Acessibilidade")
 }
 
-// Colar cola o texto no campo com foco; se o pasteboard falhar, digita.
+// Colar preserva a API simples para callers sem logging detalhado.
 func Colar(texto string) error {
-	if texto == "" {
-		return nil
-	}
-	if err := permissaoPostar(); err != nil {
-		return err // sem permissão, Digitar também falharia
-	}
-	if err := colarPasteboard(texto); err != nil {
-		return Digitar(texto)
-	}
-	return nil
+	_, err := ColarDiagnostico(texto)
+	return err
 }
 
-func colarPasteboard(texto string) error {
+// ColarDiagnostico registra foco, modificadores, pasteboard e eventos enviados.
+// O macOS não confirma que o aplicativo de destino inseriu o texto.
+func ColarDiagnostico(texto string) (d DiagnosticoColagem, err error) {
+	t0 := time.Now()
+	defer func() { d.Duracao = time.Since(t0) }()
+	d.Etapa = "início"
+	d.FocoAntes = FocoAtual()
+	if texto == "" {
+		d.Etapa = "texto vazio"
+		return d, nil
+	}
+	if err = permissaoPostar(); err != nil {
+		d.Etapa = "permissão para eventos de teclado"
+		return d, err
+	}
+	if err = colarPasteboard(texto, &d); err == nil {
+		return d, nil
+	}
+	causa := err
+	d.Fallback = "Digitar: " + causa.Error()
+	if permErr := permissaoPostar(); permErr != nil {
+		d.Etapa = "fallback bloqueado pela permissão"
+		return d, permErr
+	}
+	d.FocoNoEnvio = FocoAtual()
+	d.EventosDigitacao, err = digitarEventos(texto)
+	d.FocoDepois = FocoAtual()
+	if err != nil {
+		d.Etapa = "fallback Digitar falhou"
+		return d, err
+	}
+	d.Etapa = "fallback Digitar enviado; inserção não confirmada"
+	return d, nil
+}
+
+func colarPasteboard(texto string, d *DiagnosticoColagem) error {
 	if err := loadDarwinFrameworks(appKitPath); err != nil {
+		d.Etapa = "abrir AppKit"
 		return err
 	}
-	// Com Control/Option ainda físicos, o Command+V vira outro atalho. Na
-	// trava, o toque de destravar pode estar seguro ainda.
-	esperarModificadoresSoltosMac(2 * time.Second)
+	// Com modificadores ainda pressionados, Command+V pode virar outro atalho.
+	d.EsperaModificadores, d.ModificadoresPendentes = esperarModificadoresSoltosMacDiagnostico(2 * time.Second)
+	d.FocoDepoisDaEspera = FocoAtual()
 
 	var err error
 	comPool(func() {
 		pb := objc.ID(objc.GetClass("NSPasteboard")).Send(objc.RegisterName("generalPasteboard"))
 		if pb == 0 {
+			d.Etapa = "obter NSPasteboard"
 			err = errors.New("NSPasteboard indisponível")
 			return
 		}
-		// No macOS o pasteboard NÃO é restaurado: com a restauração, o Chrome
-		// só colava o primeiro ditado e os seguintes entravam vazios (medido
-		// em 2026-10-26: 5/0/0/0/0 restaurando, 5/5/5/5/5 sem restaurar).
-		// O ditado fica no pasteboard, marcado como transitório.
+		d.ClipboardSeqAntes = objc.Send[int64](pb, objc.RegisterName("changeCount"))
+		// Não restaurar o pasteboard: os testes mostraram que isso fazia ditados
+		// subsequentes serem colados vazios no Chrome.
 		if err = gravarPasteboard(pb, texto, true); err != nil {
+			d.Etapa = "gravar texto no pasteboard"
 			return
 		}
-		enviarCommandV()
+		d.ClipboardSeqDepois = objc.Send[int64](pb, objc.RegisterName("changeCount"))
+		conteudo := pb.Send(objc.RegisterName("stringForType:"), nsString("public.utf8-plain-text"))
+		if conteudo == 0 || !objc.Send[bool](conteudo, objc.RegisterName("isEqualToString:"), nsString(texto)) {
+			d.Etapa = "verificar texto no pasteboard"
+			err = errors.New("texto não foi confirmado no pasteboard")
+			return
+		}
+		d.ClipboardVerificado = true
+		d.FocoNoEnvio = FocoAtual()
+		d.Etapa = "enviar Command+V"
+		d.EventosPaste = enviarCommandVDiagnostico()
+		if d.EventosPaste != 4 {
+			err = fmt.Errorf("apenas %d/4 eventos Command+V foram criados", d.EventosPaste)
+			return
+		}
 		time.Sleep(esperaColarMac)
+		d.FocoDepois = FocoAtual()
+		d.ClipboardSeqDepois = objc.Send[int64](pb, objc.RegisterName("changeCount"))
+		d.Etapa = "Command+V enviado; inserção não confirmada pelo sistema"
 	})
 	return err
 }
@@ -152,23 +199,39 @@ func gravarPasteboard(pb objc.ID, texto string, transitorio bool) error {
 	return nil
 }
 
-func enviarCommandV() {
-	postarTecla(vkMacCommand, true, cgFlagCommand)
-	postarTecla(vkMacV, true, cgFlagCommand)
-	postarTecla(vkMacV, false, cgFlagCommand)
-	postarTecla(vkMacCommand, false, 0)
+func enviarCommandV() { _ = enviarCommandVDiagnostico() }
+
+func enviarCommandVDiagnostico() int {
+	eventos := 0
+	for _, e := range []struct {
+		tecla uint16
+		desce bool
+		flags uint64
+	}{
+		{vkMacCommand, true, cgFlagCommand},
+		{vkMacV, true, cgFlagCommand},
+		{vkMacV, false, cgFlagCommand},
+		{vkMacCommand, false, 0},
+	} {
+		if postarTecla(e.tecla, e.desce, e.flags) {
+			eventos++
+		}
+	}
+	return eventos
 }
 
 // postarTecla injeta uma tecla marcada (o tap do Teclado ignora a marca).
-func postarTecla(tecla uint16, desce bool, flags uint64) {
+// true significa que o evento foi criado e enviado ao Quartz, não que o app o aceitou.
+func postarTecla(tecla uint16, desce bool, flags uint64) bool {
 	ev := cgCreateKeyboardEvent(0, tecla, desce)
 	if ev == 0 {
-		return
+		return false
 	}
 	defer cgEventRelease(ev)
 	cgEventSetFlags(ev, flags)
 	cgEventSetInt(ev, cgEventSourceUserData, macEventTag)
 	cgEventPost(cgPostEventToSession, ev)
+	return true
 }
 
 // Digitar insere o texto no campo com foco como se fosse digitado: blocos de
@@ -180,17 +243,27 @@ func Digitar(texto string) error {
 	if err := permissaoPostar(); err != nil {
 		return err
 	}
+	_, err := digitarEventos(texto)
+	return err
+}
+
+func digitarEventos(texto string) (int, error) {
+	eventos := 0
 	for _, parte := range partesDigitacao(texto) {
 		if parte == nil {
-			postarTecla(vkMacReturn, true, 0)
-			postarTecla(vkMacReturn, false, 0)
+			if !postarTecla(vkMacReturn, true, 0) || !postarTecla(vkMacReturn, false, 0) {
+				return eventos, errors.New("CGEventCreateKeyboardEvent falhou ao enviar Return")
+			}
+			eventos += 2
 			continue
 		}
-		if err := postarUnicode(parte); err != nil {
-			return err
+		n, err := postarUnicode(parte)
+		eventos += n
+		if err != nil {
+			return eventos, err
 		}
 	}
-	return nil
+	return eventos, nil
 }
 
 // partesDigitacao corta o texto em blocos de até maxUnicodePorEvento unidades
@@ -214,37 +287,50 @@ func partesDigitacao(texto string) [][]uint16 {
 	return partes
 }
 
-func postarUnicode(u []uint16) error {
+func postarUnicode(u []uint16) (int, error) {
+	eventos := 0
 	for _, desce := range []bool{true, false} {
 		ev := cgCreateKeyboardEvent(0, 0, desce)
 		if ev == 0 {
-			return errors.New("CGEventCreateKeyboardEvent falhou")
+			return eventos, errors.New("CGEventCreateKeyboardEvent falhou")
 		}
 		cgKeyboardSetUnicode(ev, uint64(len(u)), &u[0])
 		cgEventSetFlags(ev, 0)
 		cgEventSetInt(ev, cgEventSourceUserData, macEventTag)
 		cgEventPost(cgPostEventToSession, ev)
 		cgEventRelease(ev)
+		eventos++
 	}
 	runtime.KeepAlive(u)
-	return nil
+	return eventos, nil
 }
 
-func esperarModificadoresSoltosMac(teto time.Duration) {
-	limite := time.Now().Add(teto)
-	teclas := []uint16{vkMacControl, vkMacOption, vkMacShift, vkMacCommand,
-		vkMacRightCtrl, vkMacRightOpt, vkMacRightShift, vkMacRightCmd}
-	for time.Now().Before(limite) {
-		apertada := false
+func esperarModificadoresSoltosMacDiagnostico(teto time.Duration) (time.Duration, []string) {
+	inicio := time.Now()
+	limite := inicio.Add(teto)
+	teclas := []struct {
+		codigo uint16
+		nome   string
+	}{
+		{vkMacControl, "control"}, {vkMacOption, "option"}, {vkMacShift, "shift"}, {vkMacCommand, "command"},
+		{vkMacRightCtrl, "right-control"}, {vkMacRightOpt, "right-option"},
+		{vkMacRightShift, "right-shift"}, {vkMacRightCmd, "right-command"},
+	}
+	var pendentes []string
+	for {
+		pendentes = pendentes[:0]
 		for _, k := range teclas {
-			if cgEventSourceKeyState(cgStateHID, k) {
-				apertada = true
-				break
+			if cgEventSourceKeyState(cgStateHID, k.codigo) {
+				pendentes = append(pendentes, k.nome)
 			}
 		}
-		if !apertada {
-			return
+		if len(pendentes) == 0 || !time.Now().Before(limite) {
+			return time.Since(inicio), append([]string(nil), pendentes...)
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
+}
+
+func esperarModificadoresSoltosMac(teto time.Duration) {
+	_, _ = esperarModificadoresSoltosMacDiagnostico(teto)
 }

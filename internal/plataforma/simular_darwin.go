@@ -5,8 +5,6 @@ package plataforma
 import (
 	"sync"
 	"time"
-
-	"github.com/ebitengine/purego/objc"
 )
 
 var (
@@ -50,30 +48,6 @@ var errSemSetType = errorString("CGEventSetType indisponível")
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
-
-// AppEmFoco devolve o nome do app que recebe a colagem (diagnóstico no log).
-func AppEmFoco() string {
-	if loadDarwinFrameworks(appKitPath) != nil {
-		return ""
-	}
-	nome := ""
-	comPool(func() {
-		ws := objc.ID(objc.GetClass("NSWorkspace")).Send(objc.RegisterName("sharedWorkspace"))
-		if ws == 0 {
-			return
-		}
-		app := ws.Send(objc.RegisterName("frontmostApplication"))
-		if app == 0 {
-			return
-		}
-		if s := app.Send(objc.RegisterName("localizedName")); s != 0 {
-			if p := s.Send(objc.RegisterName("UTF8String")); p != 0 {
-				nome = goString(uintptr(p))
-			}
-		}
-	})
-	return nome
-}
 
 func goString(p uintptr) string {
 	var b []byte

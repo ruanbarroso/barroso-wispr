@@ -48,40 +48,86 @@ const (
 // Ctrl+V é assíncrono: restaurar cedo demais cola o conteúdo ANTIGO.
 const esperaColar = 300 * time.Millisecond
 
-// Colar cola o texto no campo com foco; se o clipboard falhar, digita.
+// Colar mantém a API simples para callers sem logging detalhado.
 func Colar(texto string) error {
-	if texto == "" {
-		return nil
-	}
-	if err := colarClipboard(texto); err != nil {
-		return Digitar(texto)
-	}
-	return nil
+	_, err := ColarDiagnostico(texto)
+	return err
 }
 
-func colarClipboard(texto string) error {
-	// Com Ctrl/Alt/Shift/Win ainda físicos, o Ctrl+V vira Ctrl+Alt+V (atalho
-	// de outro app). Na trava, o toque de destravar pode estar seguro ainda.
-	esperarModificadoresSoltos(2 * time.Second)
+// ColarDiagnostico registra foco, estado do clipboard e eventos de teclado
+// aceitos pelo sistema. O Windows não confirma inserção no controle de destino.
+func ColarDiagnostico(texto string) (d DiagnosticoColagem, err error) {
+	t0 := time.Now()
+	defer func() { d.Duracao = time.Since(t0) }()
+	d.Etapa = "início"
+	d.FocoAntes = FocoAtual()
+	if texto == "" {
+		d.Etapa = "texto vazio"
+		return d, nil
+	}
+	if err = colarClipboard(texto, &d); err == nil {
+		return d, nil
+	}
+	causa := err
+	d.Fallback = "Digitar: " + causa.Error()
+	d.FocoNoEnvio = FocoAtual()
+	d.EventosDigitacao, err = digitarEventos(texto)
+	d.FocoDepois = FocoAtual()
+	if err != nil {
+		d.Etapa = "fallback Digitar falhou"
+		return d, err
+	}
+	d.Etapa = "fallback Digitar enviado; inserção não confirmada"
+	return d, nil
+}
 
-	// Copia TUDO o que o usuário tinha (texto, print, arquivos...) para
-	// devolver depois do Ctrl+V. Sem cópia, o ditado fica no clipboard.
+func colarClipboard(texto string, d *DiagnosticoColagem) error {
+	// Com Ctrl/Alt/Shift/Win ainda físicos, o Ctrl+V vira outro atalho.
+	d.EsperaModificadores, d.ModificadoresPendentes = esperarModificadoresSoltosDiagnostico(2 * time.Second)
+	d.FocoDepoisDaEspera = FocoAtual()
+
 	anterior, errCopia := copiarClipboard()
+	if errCopia != nil {
+		d.ClipboardReadError = errCopia.Error()
+	}
+	d.ClipboardSeqAntes = int64(sequenciaClipboard())
 	if err := gravarTexto(texto, true); err != nil {
+		d.Etapa = "gravar texto no clipboard"
 		return err
 	}
-	nossa := sequenciaClipboard()
-	if err := enviarCtrlV(); err != nil {
+	d.ClipboardSeqDepois = int64(sequenciaClipboard())
+	if copiado, ok := lerTexto(); !ok || copiado != texto {
+		d.Etapa = "verificar texto no clipboard"
+		d.ClipboardReadError = "não foi possível ler de volta o texto gravado"
+		return errors.New("texto não foi confirmado no clipboard")
+	}
+	// Sequência antes do envio: se continuar igual após a espera, o ditado
+	// ainda é o dono do clipboard e pode ser devolvido.
+	seqDitado := sequenciaClipboard()
+
+	d.ClipboardVerificado = true
+	d.FocoNoEnvio = FocoAtual()
+	d.Etapa = "enviar Ctrl+V"
+	var err error
+	d.EventosPaste, err = enviarCtrlVDiagnostico()
+	if err != nil {
 		if errCopia == nil {
-			_ = anterior.restaurar()
+			if restoreErr := anterior.restaurar(); restoreErr != nil {
+				d.ClipboardRestoreError = restoreErr.Error()
+			}
 		}
 		return err
 	}
 	time.Sleep(esperaColar)
+	d.FocoDepois = FocoAtual()
+	d.ClipboardSeqDepois = int64(sequenciaClipboard())
 	// Se o usuário copiou algo novo nesse intervalo, o clipboard já é dele.
-	if errCopia == nil && sequenciaClipboard() == nossa {
-		_ = anterior.restaurar()
+	if errCopia == nil && sequenciaClipboard() == seqDitado {
+		if restoreErr := anterior.restaurar(); restoreErr != nil {
+			d.ClipboardRestoreError = restoreErr.Error()
+		}
 	}
+	d.Etapa = "Ctrl+V enviado; inserção não confirmada pelo sistema"
 	return nil
 }
 
@@ -160,6 +206,11 @@ func gravarTexto(texto string, foraDoHistorico bool) error {
 }
 
 func enviarCtrlV() error {
+	_, err := enviarCtrlVDiagnostico()
+	return err
+}
+
+func enviarCtrlVDiagnostico() (int, error) {
 	ins := []input{
 		{Type: inputKeyboard, Ki: keybdinput{WVk: vkControl}},
 		{Type: inputKeyboard, Ki: keybdinput{WVk: vkV}},
@@ -171,9 +222,9 @@ func enviarCtrlV() error {
 		if err == nil || errors.Is(err, windows.ERROR_SUCCESS) {
 			err = errors.New("SendInput bloqueado (janela com privilégio maior, ex.: app como administrador)")
 		}
-		return err
+		return int(n), err
 	}
-	return nil
+	return int(n), nil
 }
 
 func teclaFisicaApertada(vk uintptr) bool {
@@ -181,13 +232,33 @@ func teclaFisicaApertada(vk uintptr) bool {
 	return r&0x8000 != 0
 }
 
-func esperarModificadoresSoltos(teto time.Duration) {
-	limite := time.Now().Add(teto)
-	for time.Now().Before(limite) {
-		if !teclaFisicaApertada(vkControl) && !teclaFisicaApertada(vkMenu) &&
-			!teclaFisicaApertada(vkShift) && !teclaFisicaApertada(vkLWin) && !teclaFisicaApertada(vkRWin) {
-			return
+func esperarModificadoresSoltosDiagnostico(teto time.Duration) (time.Duration, []string) {
+	inicio := time.Now()
+	limite := inicio.Add(teto)
+	teclas := []struct {
+		vk   uintptr
+		nome string
+	}{
+		{vkControl, "control"}, {vkMenu, "alt"}, {vkShift, "shift"},
+		{vkLControl, "left-control"}, {vkRControl, "right-control"},
+		{vkLMenu, "left-alt"}, {vkRMenu, "right-alt"},
+		{vkLWin, "left-win"}, {vkRWin, "right-win"},
+	}
+	var pendentes []string
+	for {
+		pendentes = pendentes[:0]
+		for _, k := range teclas {
+			if teclaFisicaApertada(k.vk) {
+				pendentes = append(pendentes, k.nome)
+			}
+		}
+		if len(pendentes) == 0 || !time.Now().Before(limite) {
+			return time.Since(inicio), append([]string(nil), pendentes...)
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
+}
+
+func esperarModificadoresSoltos(teto time.Duration) {
+	_, _ = esperarModificadoresSoltosDiagnostico(teto)
 }

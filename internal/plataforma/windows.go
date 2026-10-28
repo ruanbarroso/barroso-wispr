@@ -275,8 +275,13 @@ func (t *Teclado) mudou(b *atomic.Bool, desce, sobe bool) {
 // (acentos e emojis incluídos). Quebras de linha viram Shift+Enter? Não: \n
 // vira Enter, que é o que um usuário digitando faria.
 func Digitar(texto string) error {
+	_, err := digitarEventos(texto)
+	return err
+}
+
+func digitarEventos(texto string) (int, error) {
 	if texto == "" {
-		return nil
+		return 0, nil
 	}
 	var ins []input
 	for _, u := range utf16.Encode([]rune(texto)) {
@@ -293,12 +298,15 @@ func Digitar(texto string) error {
 			input{Type: inputKeyboard, Ki: keybdinput{WScan: u, DwFlags: keyeventfUnicode}},
 			input{Type: inputKeyboard, Ki: keybdinput{WScan: u, DwFlags: keyeventfUnicode | keyeventfKeyUp}})
 	}
+	if len(ins) == 0 {
+		return 0, nil
+	}
 	n, _, err := procSendInput.Call(uintptr(len(ins)), uintptr(unsafe.Pointer(&ins[0])), unsafe.Sizeof(ins[0]))
 	if int(n) != len(ins) {
 		if err == nil || errors.Is(err, windows.ERROR_SUCCESS) {
 			err = errors.New("SendInput bloqueado (janela com privilégio maior, ex.: app como administrador)")
 		}
-		return err
+		return int(n), err
 	}
-	return nil
+	return int(n), nil
 }
