@@ -141,7 +141,11 @@ func run() int {
 				fmt.Fprintf(log, "%s erro na colagem (%d caracteres): %v; diagnóstico: %s\n", time.Now().Format("15:04:05.000"), len([]rune(s)), err, diag)
 				return err
 			}
-			fmt.Fprintf(log, "%s colagem solicitada (%d caracteres; inserção não confirmada pelo SO); diagnóstico: %s\n", time.Now().Format("15:04:05.000"), len([]rune(s)), diag)
+			confirmada := "inserção não confirmada pelo SO"
+			if diag.InsercaoConfirmada {
+				confirmada = "inserção confirmada pelo campo focado"
+			}
+			fmt.Fprintf(log, "%s colagem solicitada (%d caracteres; %s); diagnóstico: %s\n", time.Now().Format("15:04:05.000"), len([]rune(s)), confirmada, diag)
 			return nil
 		}
 	}

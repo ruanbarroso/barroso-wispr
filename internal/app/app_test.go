@@ -507,6 +507,11 @@ func TestAtalhoDuploTravaENovoPressionamentoEncerra(t *testing.T) {
 	a.Soltou()
 	a.Pressionou()
 	a.Soltou()
+	// O duplo toque só vira trava depois da janela em que um terceiro toque
+	// ainda poderia descartar o gesto: o tick fecha essa janela.
+	a.tratar(a.comMaq(func(m *atalho.Maquina) atalho.Evento {
+		return m.Tick(time.Now().Add(atalho.ToqueDuplo + time.Millisecond))
+	}))
 	select {
 	case got := <-beeps:
 		if got != "ready" {

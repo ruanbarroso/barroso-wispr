@@ -169,6 +169,7 @@ func colarPasteboard(texto string, d *DiagnosticoColagem) error {
 		}
 		d.ClipboardVerificado = true
 		d.FocoNoEnvio = FocoAtual()
+		campoAntes := verificarCampoFocado(d.FocoNoEnvio.PID)
 		d.Etapa = "enviar Command+V"
 		d.EventosPaste = enviarCommandVDiagnostico()
 		if d.EventosPaste != 4 {
@@ -177,8 +178,18 @@ func colarPasteboard(texto string, d *DiagnosticoColagem) error {
 		}
 		time.Sleep(esperaColarMac)
 		d.FocoDepois = FocoAtual()
+		campoDepois := verificarCampoFocado(d.FocoNoEnvio.PID)
+		resultado := compararCampo(campoAntes, campoDepois, texto)
+		d.VerificacaoCampo = resultado.resumo()
+		d.InsercaoConfirmada = resultado.TextoPresente
 		d.ClipboardSeqDepois = objc.Send[int64](pb, objc.RegisterName("changeCount"))
-		d.Etapa = "Command+V enviado; inserção não confirmada pelo sistema"
+		if resultado.TextoPresente {
+			d.Etapa = "Command+V enviado; inserção confirmada pelo Accessibility API"
+		} else if strings.HasPrefix(resultado.Resultado, "falhou:") {
+			d.Etapa = "Command+V enviado, mas texto ausente no campo AX focado"
+		} else {
+			d.Etapa = "Command+V enviado; Accessibility API inconclusiva"
+		}
 	})
 	return err
 }

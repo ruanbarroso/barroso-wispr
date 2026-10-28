@@ -38,13 +38,19 @@ type DiagnosticoColagem struct {
 	EventosPaste           int
 	EventosDigitacao       int
 	Fallback               string
-	Duracao                time.Duration
+	// VerificacaoCampo (macOS) registra a leitura AXValue do campo focado antes e
+	// depois do Command+V e a conclusão: confirmada, inconclusiva ou falhou.
+	// Fica vazio no Windows, onde não há leitura equivalente sem injeção.
+	VerificacaoCampo   string
+	InsercaoConfirmada bool // true só quando o controle focado confirmou o texto via AX
+	Duracao            time.Duration
 }
 
 func (d DiagnosticoColagem) String() string {
-	return fmt.Sprintf("etapa=%q focoAntes={%s} focoDepoisDaEspera={%s} focoNoEnvio={%s} focoDepois={%s} esperaModificadores=%s modificadoresPendentes=%q clipboardVerificado=%t clipboardSeq=%d->%d clipboardReadError=%q clipboardRestoreError=%q eventosPaste=%d eventosDigitacao=%d fallback=%q duracao=%s",
+	return fmt.Sprintf("etapa=%q focoAntes={%s} focoDepoisDaEspera={%s} focoNoEnvio={%s} focoDepois={%s} esperaModificadores=%s modificadoresPendentes=%q clipboardVerificado=%t clipboardSeq=%d->%d clipboardReadError=%q clipboardRestoreError=%q eventosPaste=%d eventosDigitacao=%d fallback=%q insercaoConfirmada=%t verificacaoCampo=%q duracao=%s",
 		d.Etapa, d.FocoAntes, d.FocoDepoisDaEspera, d.FocoNoEnvio, d.FocoDepois,
 		d.EsperaModificadores, d.ModificadoresPendentes, d.ClipboardVerificado,
 		d.ClipboardSeqAntes, d.ClipboardSeqDepois, d.ClipboardReadError,
-		d.ClipboardRestoreError, d.EventosPaste, d.EventosDigitacao, d.Fallback, d.Duracao)
+		d.ClipboardRestoreError, d.EventosPaste, d.EventosDigitacao, d.Fallback,
+		d.InsercaoConfirmada, d.VerificacaoCampo, d.Duracao)
 }
