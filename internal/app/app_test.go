@@ -844,15 +844,23 @@ func TestAudioCurtoOuSilenciosoIgnorado(t *testing.T) {
 		nome string
 		pcm  []byte
 	}{
+		{nome: "sem áudio", pcm: nil},
 		{nome: "menos de um segundo", pcm: pcmSinteticoFalado(900 * time.Millisecond)},
 		{nome: "silêncio", pcm: make([]byte, 2*bytesPorSegundo)},
+		{nome: "ruído contínuo", pcm: pcmRuido(time.Second, 5000)},
+		{nome: "zumbido contínuo", pcm: pcmTom(time.Second, 60, 4000)},
 	}
 	for _, tc := range casos {
 		t.Run(tc.nome, func(t *testing.T) {
 			colagens := 0
 			a := newAppTest(t, sessaoVazia{}, func(string) error { colagens++; return nil })
 			a.d.Microfone = &micComAudio{pcm: tc.pcm}
-			aberturas, transcricoes := 0, 0
+			aberturas, transcricoes, pulsosVerdes := 0, 0, 0
+			a.d.EstadoProcessando = func(ativo bool) {
+				if ativo {
+					pulsosVerdes++
+				}
+			}
 			a.d.Abrir = func(context.Context, string, string, string) (Sessao, error) {
 				aberturas++
 				return sessaoVazia{}, nil
@@ -871,6 +879,9 @@ func TestAudioCurtoOuSilenciosoIgnorado(t *testing.T) {
 			}
 			if colagens != 0 {
 				t.Errorf("colou %d vez(es), esperava nenhuma", colagens)
+			}
+			if pulsosVerdes != 0 {
+				t.Errorf("ativou o indicador verde %d vez(es), esperava nenhuma", pulsosVerdes)
 			}
 		})
 	}

@@ -158,7 +158,6 @@ type gravacao struct {
 	audio          []byte   // áudio válido para a transcrição de reserva
 	detector       detectorVoz
 	bytesAud       int
-	bytesVoz       int
 	sessaoIniciada bool
 	// captureMu/capturando controlam o callback de estado da captura, isolado
 	// do beep: o microfone já desligou, mas a finalização/colagem ainda segue.
@@ -371,11 +370,11 @@ func (a *App) iniciar(g *gravacao) {
 		g.mu.Lock()
 		if !g.sessaoIniciada {
 			g.bytesAud += len(b)
-			g.bytesVoz += g.detector.processar(b)
+			g.detector.processar(b)
 		}
 		if g.sessao == nil {
 			g.pendente = append(g.pendente, b)
-			abrir := !g.sessaoIniciada && g.bytesAud >= minDitadoBytes && g.bytesVoz >= minVozBytes
+			abrir := !g.sessaoIniciada && g.bytesAud >= minDitadoBytes && g.detector.falaConfirmada()
 			if abrir {
 				g.sessaoIniciada = true
 				if a.d.Transcrever != nil {

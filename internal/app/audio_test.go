@@ -1,7 +1,9 @@
 package app
 
 import (
+	"encoding/binary"
 	"math"
+	"math/rand"
 	"testing"
 	"time"
 )
@@ -20,13 +22,44 @@ func pcmSinteticoFalado(duracao time.Duration) []byte {
 	return pcm
 }
 
-func TestDetectorVozFalaSilencio(t *testing.T) {
-	detector := novoDetectorVoz()
-	if got := detector.processar(make([]byte, bytesPorSegundo)); got != 0 {
-		t.Fatalf("silêncio classificado como voz: %d bytes", got)
+func pcmRuido(duracao time.Duration, amplitude int32) []byte {
+	amostras := int(duracao.Seconds() * 16000)
+	pcm := make([]byte, amostras*2)
+	r := rand.New(rand.NewSource(1))
+	for i := 0; i < amostras; i++ {
+		amostra := int16(r.Int31n(2*amplitude+1) - amplitude)
+		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(amostra))
 	}
-	detector = novoDetectorVoz()
-	if got := detector.processar(pcmSinteticoFalado(time.Second)); got < minVozBytes {
-		t.Fatalf("fala sintética classificada como silêncio: %d bytes de voz", got)
+	return pcm
+}
+
+func pcmTom(duracao time.Duration, frequencia, amplitude float64) []byte {
+	amostras := int(duracao.Seconds() * 16000)
+	pcm := make([]byte, amostras*2)
+	for i := 0; i < amostras; i++ {
+		amostra := int16(math.Sin(2*math.Pi*frequencia*float64(i)/16000) * amplitude)
+		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(amostra))
+	}
+	return pcm
+}
+
+func TestDetectorVozFalaSilencioERuido(t *testing.T) {
+	for _, tc := range []struct {
+		nome string
+		pcm  []byte
+		voz  bool
+	}{
+		{nome: "silêncio", pcm: make([]byte, bytesPorSegundo)},
+		{nome: "ruído contínuo", pcm: pcmRuido(time.Second, 5000)},
+		{nome: "zumbido contínuo", pcm: pcmTom(time.Second, 60, 4000)},
+		{nome: "fala", pcm: pcmSinteticoFalado(time.Second), voz: true},
+	} {
+		t.Run(tc.nome, func(t *testing.T) {
+			detector := novoDetectorVoz()
+			detector.processar(tc.pcm)
+			if got := detector.falaConfirmada(); got != tc.voz {
+				t.Fatalf("falaConfirmada() = %t, want %t", got, tc.voz)
+			}
+		})
 	}
 }
