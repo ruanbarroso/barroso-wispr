@@ -2,5 +2,7 @@ github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/ebitengine/purego v0.11.2 h1:WWiTx8rD8zYdOwSj8O/NiNbsOvSAgJMTlyV1XlbUSeU=
 github.com/ebitengine/purego v0.11.2/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
+github.com/rolandhe/go-vad v0.0.0-20260516173913-73b02b0699ec h1:DEvect5aaRiBnrD/X/iZXuR+8vH78Tz8D9PghtUmVg8=
+github.com/rolandhe/go-vad v0.0.0-20260516173913-73b02b0699ec/go.mod h1:L9Yrfnjq3/70QplJUN0D7aEW/2BxbH0T6Yyu/B1Xc6E=
 golang.org/x/sys v0.32.0 h1:s77OFDvIQeibCmezSnk/q6iAfkdiQaJi4VzroCFrN20=
 golang.org/x/sys v0.32.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=

@@ -141,20 +141,25 @@ func (a *App) tokenPronto(ctx context.Context) (gateway.Token, bool) {
 }
 
 type gravacao struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	inicio   time.Time
-	pronta   chan struct{} // fecha quando a sessão abriu (ou falhou)
-	sessao   Sessao
-	token    gateway.Token
-	err      error
-	caiu     bool
-	lote     *lote
-	parte    int // posição deste ditado no lote
-	mu       sync.Mutex
-	pendente [][]byte // áudio capturado antes de a sessão abrir
-	audio    []byte   // todo o áudio do ditado, para a transcrição de reserva
-	bytesAud int
+	ctx            context.Context
+	cancel         context.CancelFunc
+	inicio         time.Time
+	pronta         chan struct{} // fecha quando abre a sessão, falha ou o áudio é descartado
+	sessao         Sessao
+	token          gateway.Token
+	err            error
+	caiu           bool
+	lote           *lote
+	parte          int // posição deste ditado no lote
+	mu             sync.Mutex
+	audioMu        sync.Mutex // ordena captura com a abertura e o envio à Live
+	prontaUma      sync.Once
+	pendente       [][]byte // buffer local até a validação e abertura da Live
+	audio          []byte   // áudio válido para a transcrição de reserva
+	detector       detectorVoz
+	bytesAud       int
+	bytesVoz       int
+	sessaoIniciada bool
 	// captureMu/capturando controlam o callback de estado da captura, isolado
 	// do beep: o microfone já desligou, mas a finalização/colagem ainda segue.
 	captureMu              sync.Mutex
@@ -335,7 +340,7 @@ func (a *App) tratar(x acao) {
 // reservar cria a gravação e a registra em a.rec; a.mu deve estar travado.
 func (a *App) reservar() *gravacao {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	g := &gravacao{ctx: ctx, cancel: cancel, inicio: time.Now(), pronta: make(chan struct{})}
+	g := &gravacao{ctx: ctx, cancel: cancel, inicio: time.Now(), pronta: make(chan struct{}), detector: novoDetectorVoz()}
 	if a.lote == nil {
 		a.lote = &lote{}
 	}
@@ -358,77 +363,129 @@ func (a *App) comecar() {
 	a.iniciar(g)
 }
 
-// iniciar liga o microfone NA HORA e abre a sessão em paralelo: o áudio de
-// antes do setup fica em buffer e é enviado quando ele completa. A borda azul
-// e o som de entrada só aparecem quando a sessão abriu: o usuário fala
-// depois de ver a borda, e a partir dali o áudio vai direto para a Live.
+// iniciar captura localmente e só abre a Live depois de 1 s de áudio com voz.
 func (a *App) iniciar(g *gravacao) {
-	ctx := g.ctx
 	err := a.d.Microfone.Iniciar(func(pcm []byte) {
 		b := append([]byte(nil), pcm...)
+		g.audioMu.Lock()
 		g.mu.Lock()
-		if a.d.Transcrever != nil {
-			g.audio = append(g.audio, b...)
+		if !g.sessaoIniciada {
+			g.bytesAud += len(b)
+			g.bytesVoz += g.detector.processar(b)
 		}
-		g.bytesAud += len(b)
 		if g.sessao == nil {
 			g.pendente = append(g.pendente, b)
+			abrir := !g.sessaoIniciada && g.bytesAud >= minDitadoBytes && g.bytesVoz >= minVozBytes
+			if abrir {
+				g.sessaoIniciada = true
+				if a.d.Transcrever != nil {
+					for _, bloco := range g.pendente {
+						g.audio = append(g.audio, bloco...)
+					}
+				}
+			} else if !g.sessaoIniciada {
+				g.pendente = limitarPreRoll(g.pendente, preRollMaxBytes)
+			} else if a.d.Transcrever != nil {
+				g.audio = append(g.audio, b...)
+			}
 			g.mu.Unlock()
+			g.audioMu.Unlock()
+			if abrir {
+				go a.abrirSessao(g)
+			}
 			return
 		}
 		s := g.sessao
+		if a.d.Transcrever != nil {
+			g.audio = append(g.audio, b...)
+		}
 		g.mu.Unlock()
 		_ = s.EnviarAudio(g.ctx, b)
+		g.audioMu.Unlock()
 	})
-	micOK := err == nil
 	if err != nil {
+		g.mu.Lock()
+		g.err = fmt.Errorf("microfone: %w", err)
+		g.mu.Unlock()
 		a.logf("microfone: %v", err)
 		a.notificarEstadoGravacao(g, false)
+		g.prontaUma.Do(func() { close(g.pronta) })
 	}
+}
 
-	go func() {
-		defer close(g.pronta)
-		tok, aquecido := a.tokenPronto(ctx)
-		if !aquecido {
-			var err error
-			tok, err = a.d.Gateway.LiveToken(ctx, a.d.ModeloVoz)
-			if err != nil {
-				g.err = fmt.Errorf("live-token: %w", err)
-				return
-			}
+func limitarPreRoll(blocos [][]byte, maxBytes int) [][]byte {
+	total := 0
+	for _, bloco := range blocos {
+		total += len(bloco)
+	}
+	remover := total - maxBytes
+	for remover > 0 && len(blocos) > 0 {
+		if remover >= len(blocos[0]) {
+			remover -= len(blocos[0])
+			blocos = blocos[1:]
+			continue
 		}
-		tToken := time.Since(g.inicio)
-		g.token = tok
-		s, err := a.d.Abrir(ctx, tok.Token, tok.Servido, limpeza.DicaLive(a.d.Dicionario()))
+		if remover%2 != 0 {
+			remover++
+		}
+		if remover >= len(blocos[0]) {
+			blocos = blocos[1:]
+		} else {
+			blocos[0] = blocos[0][remover:]
+		}
+		break
+	}
+	return blocos
+}
+
+func (a *App) abrirSessao(g *gravacao) {
+	defer g.prontaUma.Do(func() { close(g.pronta) })
+	ctx := g.ctx
+	tok, aquecido := a.tokenPronto(ctx)
+	if !aquecido {
+		var err error
+		tok, err = a.d.Gateway.LiveToken(ctx, a.d.ModeloVoz)
 		if err != nil {
-			g.err = fmt.Errorf("sessão Live (%s): %w", tok.Servido, err)
-			// O Google recusou depois do token emitido: avisa o gateway.
-			go a.d.Gateway.LiveFailure(context.Background(), tok.RequestID)
+			g.mu.Lock()
+			g.err = fmt.Errorf("live-token: %w", err)
+			g.mu.Unlock()
 			return
 		}
-		origem := "pedido agora"
-		if aquecido {
-			origem = "aquecido"
-		}
-		a.logf("sessão aberta em %v (token %v %s + conexão %v, %s)", time.Since(g.inicio).Round(time.Millisecond),
-			tToken.Round(time.Millisecond), origem, (time.Since(g.inicio) - tToken).Round(time.Millisecond), tok.Servido)
+	}
+	tToken := time.Since(g.inicio)
+	g.mu.Lock()
+	g.token = tok
+	g.mu.Unlock()
+	s, err := a.d.Abrir(ctx, tok.Token, tok.Servido, limpeza.DicaLive(a.d.Dicionario()))
+	if err != nil {
 		g.mu.Lock()
-		pend := g.pendente
-		g.pendente = nil
-		g.sessao = s
+		g.err = fmt.Errorf("sessão Live (%s): %w", tok.Servido, err)
 		g.mu.Unlock()
-		for _, b := range pend {
-			_ = s.EnviarAudio(ctx, b)
+		go a.d.Gateway.LiveFailure(context.Background(), tok.RequestID)
+		return
+	}
+	origem := "pedido agora"
+	if aquecido {
+		origem = "aquecido"
+	}
+	a.logf("sessão aberta em %v (token %v %s + conexão %v, %s)", time.Since(g.inicio).Round(time.Millisecond),
+		tToken.Round(time.Millisecond), origem, (time.Since(g.inicio) - tToken).Round(time.Millisecond), tok.Servido)
+	g.audioMu.Lock()
+	g.mu.Lock()
+	pend := g.pendente
+	g.pendente = nil
+	g.sessao = s
+	g.mu.Unlock()
+	for _, bloco := range pend {
+		_ = s.EnviarAudio(ctx, bloco)
+	}
+	g.audioMu.Unlock()
+	if a.notificarEstadoGravacao(g, true) {
+		a.logf("pronto para falar")
+		if a.d.BeepReady != nil {
+			a.d.BeepReady()
 		}
-		// Só agora está pronto para ouvir: acende a borda e toca a entrada. Se
-		// o usuário já soltou, notificar devolve false e nada aparece.
-		if micOK && a.notificarEstadoGravacao(g, true) {
-			a.logf("pronto para falar")
-			if a.d.BeepReady != nil {
-				a.d.BeepReady()
-			}
-		}
-	}()
+	}
 	go a.vigiarConexao(g)
 }
 
@@ -489,10 +546,31 @@ func (a *App) parar(entregar bool) {
 func (a *App) encerrar(g *gravacao, entregar bool) {
 	defer g.cancel()
 	defer a.terminouDitado() // roda por último: depois da colagem e do Fechar
-	// Depois de um ditado costuma vir outro: deixa o próximo token pronto.
-	defer a.Aquecer()
 	a.d.Microfone.Parar()
 	a.notificarEstadoGravacao(g, false)
+	g.audioMu.Lock()
+	g.mu.Lock()
+	iniciada := g.sessaoIniciada
+	erro := g.err
+	if !iniciada {
+		g.pendente = nil
+	}
+	g.mu.Unlock()
+	g.audioMu.Unlock()
+	if !iniciada {
+		g.prontaUma.Do(func() { close(g.pronta) })
+		if !entregar {
+			a.logf("gravação cancelada")
+		} else if erro != nil {
+			a.logf("%v", erro)
+		} else {
+			a.logf("gravação ignorada: menos de 1 s ou sem fala detectada")
+		}
+		a.entregar(g, "")
+		return
+	}
+	// Depois de um ditado válido costuma vir outro: deixa o próximo token pronto.
+	defer a.Aquecer()
 	if entregar {
 		a.processando(1)
 		defer a.processando(-1)

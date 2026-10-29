@@ -22,13 +22,21 @@ type micFake struct {
 	err     error
 }
 
-func (m *micFake) Iniciar(func([]byte)) error {
+func (m *micFake) Iniciar(f func([]byte)) error {
+	return m.iniciarComPCM(f, pcmSinteticoFalado(time.Second))
+}
+
+func (m *micFake) iniciarComPCM(f func([]byte), pcm []byte) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.err != nil {
+		m.mu.Unlock()
 		return m.err
 	}
 	m.active = true
+	m.mu.Unlock()
+	if len(pcm) > 0 {
+		f(pcm)
+	}
 	return nil
 }
 
@@ -792,11 +800,13 @@ func (sessaoVazia) Uso() (int, int)      { return 0, 0 }
 func (sessaoVazia) Fechar()              {}
 func (sessaoVazia) Caiu() (bool, string) { return false, "" }
 
-type micComAudio struct{ micFake }
+type micComAudio struct {
+	micFake
+	pcm []byte
+}
 
 func (m *micComAudio) Iniciar(f func([]byte)) error {
-	f(make([]byte, 32000)) // 1 s de áudio
-	return m.micFake.Iniciar(f)
+	return m.micFake.iniciarComPCM(f, m.pcm)
 }
 
 // Live sem texto: o áudio inteiro vai para a transcrição de reserva e é colado.
@@ -804,7 +814,7 @@ func TestLiveSemTextoUsaReserva(t *testing.T) {
 	colado := make(chan string, 1)
 	a := newAppTest(t, sessaoVazia{}, func(s string) error { colado <- s; return nil })
 	a.d.Chat = chatEco{}
-	a.d.Microfone = &micComAudio{}
+	a.d.Microfone = &micComAudio{pcm: pcmSinteticoFalado(time.Second)}
 	recebido := 0
 	a.d.Transcrever = func(_ context.Context, pcm []byte) (string, error) {
 		recebido = len(pcm)
@@ -826,5 +836,42 @@ func TestLiveSemTextoUsaReserva(t *testing.T) {
 	}
 	if recebido != 32000 {
 		t.Fatalf("reserva recebeu %d bytes, want 32000", recebido)
+	}
+}
+
+func TestAudioCurtoOuSilenciosoIgnorado(t *testing.T) {
+	casos := []struct {
+		nome string
+		pcm  []byte
+	}{
+		{nome: "menos de um segundo", pcm: pcmSinteticoFalado(900 * time.Millisecond)},
+		{nome: "silêncio", pcm: make([]byte, 2*bytesPorSegundo)},
+	}
+	for _, tc := range casos {
+		t.Run(tc.nome, func(t *testing.T) {
+			colagens := 0
+			a := newAppTest(t, sessaoVazia{}, func(string) error { colagens++; return nil })
+			a.d.Microfone = &micComAudio{pcm: tc.pcm}
+			aberturas, transcricoes := 0, 0
+			a.d.Abrir = func(context.Context, string, string, string) (Sessao, error) {
+				aberturas++
+				return sessaoVazia{}, nil
+			}
+			a.d.Transcrever = func(context.Context, []byte) (string, error) {
+				transcricoes++
+				return "não deveria transcrever", nil
+			}
+			a.comecar()
+			a.parar(true)
+			if aberturas != 0 {
+				t.Errorf("abriu %d sessão(ões), esperava nenhuma", aberturas)
+			}
+			if transcricoes != 0 {
+				t.Errorf("transcreveu %d vez(es), esperava nenhuma", transcricoes)
+			}
+			if colagens != 0 {
+				t.Errorf("colou %d vez(es), esperava nenhuma", colagens)
+			}
+		})
 	}
 }

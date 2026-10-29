@@ -8,3 +8,5 @@ require (
 )
 
 require github.com/ebitengine/purego v0.11.2
+
+require github.com/rolandhe/go-vad v0.0.0-20260516173913-73b02b0699ec
