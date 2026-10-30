@@ -627,7 +627,7 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 		} else if erro != nil {
 			a.logf("%v", erro)
 		} else {
-			a.logf("gravação ignorada: menos de 1 s ou sem fala detectada")
+			a.logf("gravação ignorada: menos de 1 s ou sem fala detectada (%s)", g.detector.resumo())
 		}
 		a.entregar(g, "")
 		return

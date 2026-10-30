@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 
 	"github.com/rolandhe/go-vad"
@@ -24,6 +25,17 @@ type detectorVoz struct {
 	vad     *vad.VAD
 	resto   []byte
 	quadros []quadroAudio // janela de 1 s para distinguir fala de ruído contínuo
+
+	// Estatística da gravação inteira, só para o log de descarte.
+	totalQuadros int
+	totalVoz     int
+	rmsMax       float64
+}
+
+// resumo descreve o que o microfone entregou, para diagnosticar descartes.
+func (d *detectorVoz) resumo() string {
+	return fmt.Sprintf("%.1fs de áudio, %d quadros de voz do VAD em %d, RMS máximo %.0f (de 32767)",
+		float64(d.totalQuadros)*0.02, d.totalVoz, d.totalQuadros, d.rmsMax)
 }
 
 func novoDetectorVoz() detectorVoz {
@@ -47,10 +59,18 @@ func (d *detectorVoz) processar(pcm []byte) {
 			energia += float64(amostras[i]) * float64(amostras[i])
 		}
 		resultado, err := d.vad.Process(amostras)
-		d.quadros = append(d.quadros, quadroAudio{
+		q := quadroAudio{
 			rms: math.Sqrt(energia / float64(len(amostras))),
 			voz: err == nil && resultado == vad.ResultVoice,
-		})
+		}
+		d.totalQuadros++
+		if q.voz {
+			d.totalVoz++
+		}
+		if q.rms > d.rmsMax {
+			d.rmsMax = q.rms
+		}
+		d.quadros = append(d.quadros, q)
 		if len(d.quadros) > 1000/(20) {
 			d.quadros = d.quadros[1:]
 		}
