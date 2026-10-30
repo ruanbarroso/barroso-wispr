@@ -220,6 +220,7 @@ type gravacao struct {
 	detector       detectorVoz
 	bytesAud       int
 	sessaoIniciada bool
+	descartada     bool // ditado terminado sem fala confirmada
 	// captureMu/capturando controlam o callback de estado da captura, isolado
 	// do beep: o microfone já desligou, mas a finalização/colagem ainda segue.
 	captureMu              sync.Mutex
@@ -423,47 +424,57 @@ func (a *App) comecar() {
 	a.iniciar(g)
 }
 
-// iniciar captura localmente e só abre a Live depois de 1 s de áudio com voz.
+// iniciar liga o microfone e abre a sessão Live NA HORA: a borda azul e o som
+// de entrada saem assim que a sessão está pronta, sem esperar pela fala — o
+// usuário precisa saber que já pode falar antes de falar. O detector de voz
+// só decide o que acontece com o áudio: enquanto não confirma 1 s com fala,
+// ele fica retido (com 2 s de pré-roll) e não vai para a Live; se o ditado
+// termina sem fala confirmada, é descartado sem transcrever nem colar.
 func (a *App) iniciar(g *gravacao) {
-	// O token leva de 0,5 s a 30 s: pede já, enquanto o VAD confirma a fala,
-	// para a sessão abrir sem esperar por ele (tokenPronto espera este pedido).
+	// O token leva de 0,5 s a 30 s: pede já para a sessão abrir logo.
 	a.Aquecer()
 	err := a.d.Microfone.Iniciar(func(pcm []byte) {
 		b := append([]byte(nil), pcm...)
 		g.audioMu.Lock()
 		g.mu.Lock()
+		confirmadaAgora := false
 		if !g.sessaoIniciada {
 			g.bytesAud += len(b)
 			g.detector.processar(b)
-		}
-		if g.sessao == nil {
 			g.pendente = append(g.pendente, b)
-			abrir := !g.sessaoIniciada && g.bytesAud >= minDitadoBytes && g.detector.falaConfirmada()
-			if abrir {
+			if g.bytesAud >= minDitadoBytes && g.detector.falaConfirmada() {
 				g.sessaoIniciada = true
+				confirmadaAgora = true
 				if a.d.Transcrever != nil {
 					for _, bloco := range g.pendente {
 						g.audio = append(g.audio, bloco...)
 					}
 				}
-			} else if !g.sessaoIniciada {
+			} else {
 				g.pendente = limitarPreRoll(g.pendente, preRollMaxBytes)
-			} else if a.d.Transcrever != nil {
+			}
+		} else {
+			if a.d.Transcrever != nil {
 				g.audio = append(g.audio, b...)
 			}
-			g.mu.Unlock()
-			g.audioMu.Unlock()
-			if abrir {
-				go a.abrirSessao(g)
+			if g.sessao == nil {
+				g.pendente = append(g.pendente, b) // abrirSessao envia ao abrir
 			}
-			return
 		}
+		var enviar [][]byte
 		s := g.sessao
-		if a.d.Transcrever != nil {
-			g.audio = append(g.audio, b...)
+		if g.sessaoIniciada && s != nil {
+			if confirmadaAgora {
+				enviar = g.pendente
+			} else {
+				enviar = [][]byte{b}
+			}
+			g.pendente = nil
 		}
 		g.mu.Unlock()
-		_ = s.EnviarAudio(g.ctx, b)
+		for _, bloco := range enviar {
+			_ = s.EnviarAudio(g.ctx, bloco)
+		}
 		g.audioMu.Unlock()
 	})
 	if err != nil {
@@ -473,7 +484,9 @@ func (a *App) iniciar(g *gravacao) {
 		a.logf("microfone: %v", err)
 		a.notificarEstadoGravacao(g, false)
 		g.prontaUma.Do(func() { close(g.pronta) })
+		return
 	}
+	go a.abrirSessao(g)
 }
 
 func limitarPreRoll(blocos [][]byte, maxBytes int) [][]byte {
@@ -535,9 +548,21 @@ func (a *App) abrirSessao(g *gravacao) {
 		tToken.Round(time.Millisecond), origem, (time.Since(g.inicio) - tToken).Round(time.Millisecond), tok.Servido)
 	g.audioMu.Lock()
 	g.mu.Lock()
-	pend := g.pendente
-	g.pendente = nil
+	if g.descartada || ctx.Err() != nil {
+		// O ditado terminou (sem fala) enquanto a sessão abria.
+		g.mu.Unlock()
+		g.audioMu.Unlock()
+		s.Fechar()
+		return
+	}
 	g.sessao = s
+	var pend [][]byte
+	if g.sessaoIniciada {
+		// Fala já confirmada: manda o que ficou retido. Sem fala confirmada, o
+		// áudio continua retido até o detector confirmar (ver iniciar).
+		pend = g.pendente
+		g.pendente = nil
+	}
 	g.mu.Unlock()
 	for _, bloco := range pend {
 		_ = s.EnviarAudio(ctx, bloco)
@@ -610,18 +635,30 @@ func (a *App) encerrar(g *gravacao, entregar bool) {
 	defer g.cancel()
 	defer a.terminouDitado() // roda por último: depois da colagem e do Fechar
 	a.d.Microfone.Parar()
+	g.captureMu.Lock()
+	avisouPronto := g.capturando // a borda e o som de entrada já tinham saído
+	g.captureMu.Unlock()
 	a.notificarEstadoGravacao(g, false)
 	g.audioMu.Lock()
 	g.mu.Lock()
 	iniciada := g.sessaoIniciada
 	erro := g.err
+	var sessaoAberta Sessao
 	if !iniciada {
 		g.pendente = nil
+		g.descartada = true
+		sessaoAberta = g.sessao
 	}
 	g.mu.Unlock()
 	g.audioMu.Unlock()
 	if !iniciada {
+		if sessaoAberta != nil {
+			sessaoAberta.Fechar()
+		}
 		g.prontaUma.Do(func() { close(g.pronta) })
+		if avisouPronto && a.d.BeepDone != nil {
+			a.d.BeepDone()
+		}
 		if !entregar {
 			a.logf("gravação cancelada")
 		} else if erro != nil {

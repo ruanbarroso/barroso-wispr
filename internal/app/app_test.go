@@ -855,14 +855,15 @@ func TestAudioCurtoOuSilenciosoIgnorado(t *testing.T) {
 			colagens := 0
 			a := newAppTest(t, sessaoVazia{}, func(string) error { colagens++; return nil })
 			a.d.Microfone = &micComAudio{pcm: tc.pcm}
-			aberturas, transcricoes, pulsosVerdes := 0, 0, 0
+			transcricoes, pulsosVerdes := 0, 0
 			a.d.EstadoProcessando = func(ativo bool) {
 				if ativo {
 					pulsosVerdes++
 				}
 			}
+			// A sessão abre na hora (a borda e o tom de "pode falar" não
+			// esperam pela fala), mas sem fala confirmada nada é transcrito.
 			a.d.Abrir = func(context.Context, string, string, string) (Sessao, error) {
-				aberturas++
 				return sessaoVazia{}, nil
 			}
 			a.d.Transcrever = func(context.Context, []byte) (string, error) {
@@ -871,9 +872,6 @@ func TestAudioCurtoOuSilenciosoIgnorado(t *testing.T) {
 			}
 			a.comecar()
 			a.parar(true)
-			if aberturas != 0 {
-				t.Errorf("abriu %d sessão(ões), esperava nenhuma", aberturas)
-			}
 			if transcricoes != 0 {
 				t.Errorf("transcreveu %d vez(es), esperava nenhuma", transcricoes)
 			}
@@ -884,5 +882,55 @@ func TestAudioCurtoOuSilenciosoIgnorado(t *testing.T) {
 				t.Errorf("ativou o indicador verde %d vez(es), esperava nenhuma", pulsosVerdes)
 			}
 		})
+	}
+}
+
+// A borda azul e o tom de entrada saem assim que a sessão abre, sem esperar
+// pela fala: o usuário tem de saber que já pode falar antes de falar.
+func TestBordaETomSaemSemEsperarPelaFala(t *testing.T) {
+	sess := &sessaoFake{finalizou: make(chan struct{})}
+	a := newAppTest(t, sess, func(string) error { return nil })
+	a.d.Microfone = &micComAudio{pcm: make([]byte, bytesPorSegundo/2)} // meio segundo de silêncio
+	estados := make(chan bool, 4)
+	a.d.EstadoGravacao = func(ativo bool) { estados <- ativo }
+	sons := make(chan string, 4)
+	a.d.BeepReady = func() { sons <- "ready" }
+	a.d.BeepDone = func() { sons <- "done" }
+
+	a.comecar()
+	if got := receberEstado(t, estados); !got {
+		t.Fatal("borda não acendeu antes de qualquer fala")
+	}
+	select {
+	case got := <-sons:
+		if got != "ready" {
+			t.Fatalf("som = %q, want ready", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tom de entrada não tocou antes da fala")
+	}
+
+	// Soltar sem ter falado: descarta, apaga a borda e toca o som de fim.
+	colou := false
+	a.d.Digitar = func(string) error { colou = true; return nil }
+	go a.parar(true)
+	if got := receberEstado(t, estados); got {
+		t.Fatal("borda não apagou ao soltar")
+	}
+	select {
+	case got := <-sons:
+		if got != "done" {
+			t.Fatalf("som = %q, want done", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("som de fim não tocou")
+	}
+	select {
+	case <-sess.finalizou:
+		t.Fatal("sem fala confirmada não pode finalizar nem transcrever")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if colou {
+		t.Fatal("colou texto sem ter fala")
 	}
 }
