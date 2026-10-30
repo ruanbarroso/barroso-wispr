@@ -194,6 +194,10 @@ const folgaTurno = 300 * time.Millisecond
 // folgaVazio é a espera depois de um fim de geração sem nenhuma parcial.
 const folgaVazio = 1 * time.Second
 
+// tetoSemTexto é quanto Finalizar espera, depois do fim do áudio, quando a
+// Live não mandou parcial nenhuma.
+const tetoSemTexto = 3 * time.Second
+
 // Finalizar avisa o fim do áudio e espera a transcrição assentar. O caminho
 // normal é o sinal do servidor: generationComplete (ou turnComplete) depois
 // do audioStreamEnd, mais uma folga curta. Sem esse sinal, devolve quando passa
@@ -237,6 +241,12 @@ func (s *Sessao) Finalizar(ctx context.Context, quieto, teto time.Duration) (str
 				// por uma parcial atrasada e desiste, em vez de ir até o teto —
 				// quem chama ainda tem a transcrição de reserva para tentar.
 				if turno.After(fim) && time.Since(turno) >= folgaVazio {
+					return "", nil
+				}
+				// Sem nenhuma parcial, a Live está muda (em 2026-10-29 ficou 16 s
+				// assim com a borda verde acesa). Desiste cedo para a reserva
+				// entrar em ação.
+				if time.Since(fim) >= tetoSemTexto {
 					return "", nil
 				}
 				continue

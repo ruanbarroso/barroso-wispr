@@ -104,7 +104,7 @@ func (a *App) Aquecer() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		tok, err := a.d.Gateway.LiveToken(ctx, a.d.ModeloVoz)
+		tok, err := a.buscarToken(ctx)
 		a.tokMu.Lock()
 		a.tokBusca = nil
 		if err == nil {
@@ -113,6 +113,67 @@ func (a *App) Aquecer() {
 		a.tokMu.Unlock()
 		close(feito)
 	}()
+}
+
+const (
+	tetoToken          = 8 * time.Second
+	maxTentativasToken = 3
+)
+
+// esperaHedgeToken é variável só para o teste não esperar 2,5 s.
+var esperaHedgeToken = 2500 * time.Millisecond
+
+// buscarToken pede o token Live com tentativas em paralelo: o live-token do
+// gateway costuma responder em 0,5 s, mas em 2026-10-29 algumas chamadas
+// levaram 10 s e 31 s, e o tom e a borda de "pronto" só saem depois dele. Se a
+// primeira não voltar em esperaHedgeToken (ou falhar), dispara outra; vale a
+// primeira que responder.
+func (a *App) buscarToken(ctx context.Context) (gateway.Token, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type resultado struct {
+		tok gateway.Token
+		err error
+	}
+	ch := make(chan resultado, maxTentativasToken)
+	lancar := func() {
+		go func() {
+			c, cc := context.WithTimeout(ctx, tetoToken)
+			defer cc()
+			tok, err := a.d.Gateway.LiveToken(c, a.d.ModeloVoz)
+			ch <- resultado{tok, err}
+		}()
+	}
+	tentativas, voando := 1, 1
+	lancar()
+	timer := time.NewTimer(esperaHedgeToken)
+	defer timer.Stop()
+	for {
+		select {
+		case r := <-ch:
+			voando--
+			if r.err == nil {
+				return r.tok, nil
+			}
+			if voando == 0 {
+				if tentativas >= maxTentativasToken {
+					return gateway.Token{}, r.err
+				}
+				tentativas++
+				voando++
+				lancar()
+			}
+		case <-timer.C:
+			if tentativas < maxTentativasToken {
+				tentativas++
+				voando++
+				lancar()
+				timer.Reset(esperaHedgeToken)
+			}
+		case <-ctx.Done():
+			return gateway.Token{}, ctx.Err()
+		}
+	}
 }
 
 // tokenPronto devolve o token aquecido, se ainda válido; ele é de uso único.
@@ -364,6 +425,9 @@ func (a *App) comecar() {
 
 // iniciar captura localmente e só abre a Live depois de 1 s de áudio com voz.
 func (a *App) iniciar(g *gravacao) {
+	// O token leva de 0,5 s a 30 s: pede já, enquanto o VAD confirma a fala,
+	// para a sessão abrir sem esperar por ele (tokenPronto espera este pedido).
+	a.Aquecer()
 	err := a.d.Microfone.Iniciar(func(pcm []byte) {
 		b := append([]byte(nil), pcm...)
 		g.audioMu.Lock()
@@ -443,7 +507,7 @@ func (a *App) abrirSessao(g *gravacao) {
 	tok, aquecido := a.tokenPronto(ctx)
 	if !aquecido {
 		var err error
-		tok, err = a.d.Gateway.LiveToken(ctx, a.d.ModeloVoz)
+		tok, err = a.buscarToken(ctx)
 		if err != nil {
 			g.mu.Lock()
 			g.err = fmt.Errorf("live-token: %w", err)
